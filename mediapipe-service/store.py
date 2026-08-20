@@ -158,7 +158,16 @@ def new_invite_code() -> str:
 # ── 사용자 ──
 
 def create_user(name: str) -> dict:
-    user = {"id": new_id(), "name": name.strip() or "익명 안무가", "created_at": time.time()}
+    """이름으로 로그인한다. 같은 이름이 이미 있으면 그 계정을 그대로 돌려주고(다른 기기에서도
+    같은 기록에 접근 가능), 없으면 새로 만든다. 여러 명이 같은 이름을 먼저 썼다면 가장
+    먼저 만들어진 계정을 쓴다 — 비밀번호가 없으니 이름을 아는 사람은 누구나 그 계정으로
+    행동할 수 있다는 뜻이다(데모 스코프, 사용자가 이 트레이드오프를 알고 선택함)."""
+    clean = name.strip() or "익명 안무가"
+    existing = connect().execute(
+        "SELECT id, name FROM users WHERE name = ? ORDER BY created_at ASC LIMIT 1", (clean,)).fetchone()
+    if existing:
+        return {"user_id": existing["id"], "name": existing["name"]}
+    user = {"id": new_id(), "name": clean, "created_at": time.time()}
     connect().execute("INSERT INTO users (id, name, created_at) VALUES (:id, :name, :created_at)", user)
     connect().commit()
     return {"user_id": user["id"], "name": user["name"]}
@@ -679,6 +688,81 @@ def delete_project(project_id: str) -> dict:
     return counts
 
 
+# ── 관리자 ── 일반 사용자에게는 없는 화면. main.py 의 require_admin 이 토큰을 검사한다.
+
+def admin_list_users() -> list[dict]:
+    rows = connect().execute(
+        "SELECT u.id, u.name, u.created_at,"
+        " (SELECT COUNT(*) FROM projects p WHERE p.owner_id = u.id) AS owned,"
+        " (SELECT COUNT(*) FROM collaborators c WHERE c.user_id = u.id) AS joined"
+        " FROM users u ORDER BY u.created_at DESC").fetchall()
+    return [{
+        "userId": r["id"], "name": r["name"], "ownedProjects": r["owned"], "joinedProjects": r["joined"],
+        "createdAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created_at"])),
+    } for r in rows]
+
+
+def admin_list_projects() -> list[dict]:
+    rows = connect().execute(
+        "SELECT p.id, p.name, p.license, p.created_at, u.name AS owner_name,"
+        " (SELECT COUNT(*) FROM versions v WHERE v.project_id = p.id) AS versions,"
+        " (SELECT COUNT(*) FROM collaborators c WHERE c.project_id = p.id) AS collaborators"
+        " FROM projects p JOIN users u ON u.id = p.owner_id ORDER BY p.created_at DESC").fetchall()
+    return [{
+        "id": r["id"], "name": r["name"], "license": r["license"], "ownerName": r["owner_name"],
+        "versions": r["versions"], "collaborators": r["collaborators"],
+        "createdAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created_at"])),
+    } for r in rows]
+
+
+def admin_list_practice_runs() -> list[dict]:
+    rows = connect().execute(
+        "SELECT pr.id, pr.overall_score, pr.created_at, p.name AS project_name, u.name AS user_name"
+        " FROM practice_runs pr JOIN projects p ON p.id = pr.project_id JOIN users u ON u.id = pr.user_id"
+        " ORDER BY pr.created_at DESC LIMIT 200").fetchall()
+    return [{
+        "id": r["id"], "projectName": r["project_name"], "userName": r["user_name"],
+        "overallScore": r["overall_score"],
+        "createdAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created_at"])),
+    } for r in rows]
+
+
+def admin_delete_practice_run(run_id: str) -> None:
+    connect().execute("DELETE FROM practice_runs WHERE id = ?", (run_id,))
+    connect().commit()
+
+
+def delete_user(user_id: str) -> dict:
+    """사용자를 지운다 — 관리자 전용. 이 사람이 소유한 작업은 전부 지운다(각각
+    delete_project 를 거쳐 버전·참여자까지 함께 사라짐). 남의 작업에 참여자·연습기록·
+    팔로우로 남아 있던 흔적도 지운다.
+
+    다만 남의 작업에 **반영된 버전을 남긴 적**(author_id/decided_by)이 있으면 그 사람
+    행은 지우지 않고 이름만 "삭제된 사용자"로 바꾼다 — 그 반영 자체가 남의 작업의 기록이라
+    "이력은 지우지 않는다"는 원칙과 users.id 를 참조하는 versions 의 외래키 제약 둘 다를
+    지키기 위한 절충이다.
+    """
+    owned_ids = [r["id"] for r in connect().execute(
+        "SELECT id FROM projects WHERE owner_id = ?", (user_id,)).fetchall()]
+    for project_id in owned_ids:
+        delete_project(project_id)
+    connect().execute("DELETE FROM collaborators WHERE user_id = ?", (user_id,))
+    connect().execute("DELETE FROM practice_runs WHERE user_id = ?", (user_id,))
+    connect().execute("DELETE FROM follows WHERE follower_id = ? OR following_id = ?", (user_id, user_id))
+    connect().commit()
+    still_referenced = connect().execute(
+        "SELECT COUNT(*) AS n FROM versions WHERE author_id = ? OR decided_by = ?",
+        (user_id, user_id)).fetchone()["n"]
+    if still_referenced:
+        connect().execute("UPDATE users SET name = ? WHERE id = ?", ("삭제된 사용자", user_id))
+        connect().commit()
+        return {"deletedProjects": len(owned_ids), "userRemoved": False,
+                "reason": "다른 작업에 반영한 기록이 남아 있어 이름만 지웠습니다."}
+    connect().execute("DELETE FROM users WHERE id = ?", (user_id,))
+    connect().commit()
+    return {"deletedProjects": len(owned_ids), "userRemoved": True}
+
+
 def can_propose(project_id: str, user_id: str | None) -> bool:
     """'보기만' 을 제외한 참여자와 원작자가 제안할 수 있다."""
     if not user_id:
@@ -699,6 +783,12 @@ def profile(user_id: str, viewer_id: str | None = None) -> dict | None:
 
     기여로 세는 것: 내가 만든 작업, 내 작업에 누군가를 초대한 일, 내가 초대받아 참여한 일.
     모두 행의 `created_at` 을 그대로 쓴다.
+
+    **연습 전용(비공개) 작품은 두 겹으로 가린다.** ① 참여 중인 작품 목록은 본인이 볼 때만
+    비공개 항목을 포함한다 — 아니면 "누구를 초대했는지"를 통해 제3자가 남의 프로필에서
+    비공개 작품의 존재 자체를 알아낼 수 있었다(버그). ② 비공개와 관련된 활동은 "최근
+    활동"의 글자로는 절대 보이지 않는다(본인이 보든 남이 보든) — 다만 기여 달력에는
+    무슨 일인지 없이 날짜만(칸 색) 반영된다.
     """
     user = get_user(user_id)
     if not user:
@@ -712,24 +802,28 @@ def profile(user_id: str, viewer_id: str | None = None) -> dict | None:
     joined = connect().execute(
         "SELECT p.id, p.name, p.color, p.license, u.name AS owner_name, c.permission, c.created_at"
         " FROM collaborators c JOIN projects p ON p.id = c.project_id JOIN users u ON u.id = p.owner_id"
-        " WHERE c.user_id = ? AND p.owner_id != ? ORDER BY c.created_at DESC", (user_id, user_id)).fetchall()
+        " WHERE c.user_id = ? AND p.owner_id != ?"
+        + ("" if is_me else " AND p.license != ?") + " ORDER BY c.created_at DESC",
+        (user_id, user_id) if is_me else (user_id, user_id, PRIVATE_LICENSE)).fetchall()
     invited = connect().execute(
-        "SELECT c.name, c.created_at, p.name AS project_name FROM collaborators c"
+        "SELECT c.name, c.created_at, p.name AS project_name, p.license FROM collaborators c"
         " JOIN projects p ON p.id = c.project_id"
         " WHERE p.owner_id = ? AND (c.user_id IS NULL OR c.user_id != ?) ORDER BY c.created_at DESC",
         (user_id, user_id)).fetchall()
 
-    events: list[tuple[float, str, str]] = []
+    # 네 번째 값은 "이 활동이 비공개 작품과 관련 있는가" — 최근 활동 글자에서만 걸러낸다.
+    events: list[tuple[float, str, str, bool]] = []
     for row in owned:
-        events.append((row["created_at"], "project", f"‘{row['name']}’ 작업을 시작했어요"))
+        events.append((row["created_at"], "project", f"‘{row['name']}’ 작업을 시작했어요", row["license"] == PRIVATE_LICENSE))
     for row in invited:
-        events.append((row["created_at"], "invite", f"‘{row['project_name']}’ 에 {row['name']}님을 초대했어요"))
+        events.append((row["created_at"], "invite", f"‘{row['project_name']}’ 에 {row['name']}님을 초대했어요", row["license"] == PRIVATE_LICENSE))
     for row in joined:
-        events.append((row["created_at"], "join", f"{row['owner_name']}님의 ‘{row['name']}’ 에 참여했어요"))
+        events.append((row["created_at"], "join", f"{row['owner_name']}님의 ‘{row['name']}’ 에 참여했어요", row["license"] == PRIVATE_LICENSE))
 
     # 기여 달력: 오늘이 속한 주까지 53주. 일요일 시작 (GitHub 과 같은 배치)
+    # 비공개 활동도 날짜(칸 색)에는 포함한다 — 무슨 일이었는지만 최근 활동에서 가린다.
     counts: dict[str, int] = {}
-    for stamp, _, _ in events:
+    for stamp, _, _, _ in events:
         day = time.strftime("%Y-%m-%d", time.localtime(stamp))
         counts[day] = counts.get(day, 0) + 1
 
@@ -761,6 +855,7 @@ def profile(user_id: str, viewer_id: str | None = None) -> dict | None:
     first = connect().execute("SELECT created_at FROM users WHERE id = ?", (user_id,)).fetchone()["created_at"]
 
     events.sort(key=lambda item: item[0], reverse=True)
+    visible_events = [item for item in events if not item[3]]
     return {
         "user_id": user_id, "name": user["name"],
         "handle": user_id[:7], "isMe": is_me, **follow_state(user_id, viewer_id),
@@ -772,7 +867,8 @@ def profile(user_id: str, viewer_id: str | None = None) -> dict | None:
                     + [{"id": r["id"], "name": r["name"], "color": r["color"], "license": r["license"],
                         "version": f"{r['owner_name']}님의 작업", "isOwner": False} for r in joined[:2]],
         "activity": [{"kind": kind, "text": text,
-                      "date": time.strftime("%Y-%m-%d", time.localtime(stamp))} for stamp, kind, text in events[:10]],
+                      "date": time.strftime("%Y-%m-%d", time.localtime(stamp))}
+                     for stamp, kind, text, _ in visible_events[:10]],
     }
 
 

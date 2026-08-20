@@ -23,7 +23,7 @@ from pathlib import Path
 import cv2
 import mediapipe as mp
 import numpy as np
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -174,20 +174,30 @@ def infer_range(model_path: str, video: str, start: int, count: int, warmup: int
     begin = max(0, start - warmup)
     capture.set(cv2.CAP_PROP_POS_FRAMES, begin)
     options = vision.PoseLandmarkerOptions(base_options=python.BaseOptions(model_asset_path=model_path), running_mode=vision.RunningMode.VIDEO, num_poses=1, min_pose_detection_confidence=0.5, min_tracking_confidence=0.5)
-    found, index, since_report = [], begin, 0
+    found, index, since_report, last_ts = [], begin, 0, -1
     try:
         with vision.PoseLandmarker.create_from_options(options) as pose:
             while index < start + count:
                 ok, frame = capture.read()
                 if not ok: break
-                result = pose.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), round(index / fps * 1000))
+                # 컨테이너가 실제로 기록한 프레임 시각(CAP_PROP_POS_MSEC)을 쓴다. `index / fps`로
+                # 계산하면 fps 가 59.94 같은 값을 정수로 근사해 읽히는 경우 프레임마다 오차가
+                # 조금씩 쌓여, 영상이 길어질수록 재생 화면의 실제 위치보다 계속 뒤로 밀린다
+                # (스켈레톤이 몸동작을 한 박자 늦게 따라가는 것처럼 보이는 원인이었다).
+                # 백엔드가 POS_MSEC 을 못 주거나 거꾸로 흐르는 경우에만 추정치로 대체한다 —
+                # detect_for_video 는 타임스탬프가 반드시 증가해야 한다.
+                timestamp_ms = round(capture.get(cv2.CAP_PROP_POS_MSEC))
+                if timestamp_ms <= last_ts: timestamp_ms = round(index / fps * 1000)
+                if timestamp_ms <= last_ts: timestamp_ms = last_ts + 1
+                last_ts = timestamp_ms
+                result = pose.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), timestamp_ms)
                 if index >= start:
                     world = image = visibility = None
                     if result.pose_world_landmarks and result.pose_landmarks:
                         world = [[round(p.x, 6), round(p.y, 6), round(p.z, 6)] for p in result.pose_world_landmarks[0]]
                         image = [[round(p.x, 6), round(p.y, 6), round(p.z, 6)] for p in result.pose_landmarks[0]]
                         visibility = [round(p.visibility, 4) for p in result.pose_landmarks[0]]
-                    found.append((index, world, image, visibility))
+                    found.append((index, world, image, visibility, timestamp_ms))
                     since_report += 1
                     if updates is not None and since_report >= 5:
                         updates.put(since_report); since_report = 0
@@ -208,7 +218,7 @@ def infer_all(video_path: Path, total: int, fps: float, progress=None) -> dict[i
     """
     workers = min(POSE_WORKERS, max(1, total // 45)) if total else 1
     if workers <= 1:
-        return {index: (world, image, visibility) for index, world, image, visibility in infer_range(str(MODEL_PATH), str(video_path), 0, total or 10 ** 9, 0, fps)}
+        return {index: (world, image, visibility, ts) for index, world, image, visibility, ts in infer_range(str(MODEL_PATH), str(video_path), 0, total or 10 ** 9, 0, fps)}
 
     edges = [round(total * i / workers) for i in range(workers + 1)]
     poses: dict[int, tuple] = {}
@@ -226,8 +236,8 @@ def infer_all(video_path: Path, total: int, fps: float, progress=None) -> dict[i
                 except Exception:
                     pass
             for future in futures:
-                for index, world, image, visibility in future.result():
-                    poses[index] = (world, image, visibility)
+                for index, world, image, visibility, ts in future.result():
+                    poses[index] = (world, image, visibility, ts)
     return poses
 
 
@@ -243,9 +253,10 @@ def render_previews(video_path: Path, poses: dict[int, tuple], source_hash: str,
         while True:
             ok, frame = capture.read()
             if not ok: break
-            world, image, _ = poses.get(index, (None, None, None))
-            overlay_writer.write(draw_overlay(frame, image, index, index / fps))
-            skeleton_writer.write(draw_skeleton(world, index, index / fps))
+            world, image, _, ts = poses.get(index, (None, None, None, None))
+            time_s = (ts / 1000) if ts is not None else index / fps
+            overlay_writer.write(draw_overlay(frame, image, index, time_s))
+            skeleton_writer.write(draw_skeleton(world, index, time_s))
             index += 1
     finally:
         capture.release(); overlay_writer.release(); skeleton_writer.release()
@@ -269,10 +280,11 @@ def analyze(source_hash: str, video_path: Path, progress=None) -> dict:
 
     frames, app_frames = [], []
     for index in range(total):
-        world, image, visibility = poses.get(index, (None, None, None))
+        world, image, visibility, ts = poses.get(index, (None, None, None, None))
+        time_ms = ts if ts is not None else round(index / fps * 1000)
         if world and image and visibility:
-            app_frames.append({"time_ms": round(index / fps * 1000), "world_landmarks": [{"x": p[0], "y": p[1], "z": p[2], "visibility": visibility[i]} for i, p in enumerate(world)], "image_landmarks": [{"x": p[0], "y": p[1], "z": p[2], "visibility": visibility[i]} for i, p in enumerate(image)]})
-        frames.append({"frame": index, "time_s": round(index / fps, 6), "detected": bool(world), "world": world, "image": image, "visibility": visibility})
+            app_frames.append({"time_ms": time_ms, "world_landmarks": [{"x": p[0], "y": p[1], "z": p[2], "visibility": visibility[i]} for i, p in enumerate(world)], "image_landmarks": [{"x": p[0], "y": p[1], "z": p[2], "visibility": visibility[i]} for i, p in enumerate(image)]})
+        frames.append({"frame": index, "time_s": round(time_ms / 1000, 6), "detected": bool(world), "world": world, "image": image, "visibility": visibility})
 
     # 미리보기 영상을 브라우저가 재생할 수 있는 코덱으로 바꾸는 단계. 긴 영상에서는
     # 눈에 띄게 걸리므로 분석과 구분해서 알린다.
@@ -446,6 +458,54 @@ def remove_project(project_id: str, user_id: str) -> dict:
     return {"deleted": True, "name": project["name"], **removed}
 
 
+def require_admin(x_admin_token: str | None = Header(None)) -> None:
+    admin_token = os.getenv("ADMIN_TOKEN")
+    if not admin_token: raise HTTPException(503, "서버에 ADMIN_TOKEN이 설정돼 있지 않아요.")
+    if not x_admin_token or x_admin_token != admin_token:
+        raise HTTPException(403, "관리자 토큰이 올바르지 않아요.")
+
+
+@app.post("/v1/admin/verify")
+def admin_verify(_: None = Depends(require_admin)) -> dict:
+    return {"ok": True}
+
+
+@app.get("/v1/admin/users")
+def admin_users(_: None = Depends(require_admin)) -> dict:
+    return {"users": store.admin_list_users()}
+
+
+@app.delete("/v1/admin/users/{user_id}")
+def admin_delete_user_endpoint(user_id: str, _: None = Depends(require_admin)) -> dict:
+    user = store.get_user(user_id)
+    if not user: raise HTTPException(404, "사용자를 찾을 수 없습니다.")
+    return {"name": user["name"], **store.delete_user(user_id)}
+
+
+@app.get("/v1/admin/projects")
+def admin_projects(_: None = Depends(require_admin)) -> dict:
+    return {"projects": store.admin_list_projects()}
+
+
+@app.delete("/v1/admin/projects/{project_id}")
+def admin_delete_project_endpoint(project_id: str, _: None = Depends(require_admin)) -> dict:
+    project = store.get_project(project_id)
+    if not project: raise HTTPException(404, "작업을 찾을 수 없습니다.")
+    removed = store.delete_project(project_id)
+    return {"deleted": True, "name": project["name"], **removed}
+
+
+@app.get("/v1/admin/practice")
+def admin_practice(_: None = Depends(require_admin)) -> dict:
+    return {"runs": store.admin_list_practice_runs()}
+
+
+@app.delete("/v1/admin/practice/{run_id}")
+def admin_delete_practice_endpoint(run_id: str, _: None = Depends(require_admin)) -> dict:
+    store.admin_delete_practice_run(run_id)
+    return {"deleted": True}
+
+
 @app.get("/v1/projects/{project_id}/frames")
 def read_frames(project_id: str) -> dict:
     """오버레이용 랜드마크. 파일이 커서 프로젝트 목록과 분리해 필요할 때만 받아 간다."""
@@ -573,13 +633,53 @@ def _build_merge_filter(start_s: float, end_s: float, base_duration_s: float,
     return ";".join(filters)
 
 
+def _load_app_frames(source_sha256: str | None) -> list:
+    if not source_sha256: return []
+    path = UPLOADS_PATH / f"{source_sha256}.app_frames.json"
+    if not path.exists(): return []
+    return json.loads(path.read_text(encoding="utf-8")).get("frames", [])
+
+
+def _remap_landmarks(landmarks: list, seg_w: int, seg_h: int, base_w: int, base_h: int) -> list:
+    """구간 영상이 base 캔버스에 letterbox(scale+pad)될 때와 같은 변환을 좌표에도 적용한다.
+    `_build_merge_filter`가 실제 화면에 적용하는 scale+pad 를 좌표가 따라가지 않으면
+    두 영상의 화면비가 다를 때 스켈레톤이 몸에서 밀려 보인다."""
+    if not seg_w or not seg_h or not landmarks: return landmarks
+    scale = min(base_w / seg_w, base_h / seg_h)
+    box_w, box_h = seg_w * scale, seg_h * scale
+    offset_x, offset_y = (base_w - box_w) / 2, (base_h - box_h) / 2
+    return [{**point, "x": (offset_x + point["x"] * box_w) / base_w,
+             "y": (offset_y + point["y"] * box_h) / base_h} for point in landmarks]
+
+
+def _build_merged_frames(base_hash: str, seg_hash: str | None, start_ms: int, end_ms: int, seg_duration_ms: float,
+                         seg_width: int, seg_height: int, base_width: int, base_height: int) -> list:
+    """합쳐진 영상과 정확히 같은 순서(원본 앞부분 → 구간 영상 → 원본 뒷부분)로, 같은
+    시간 축 위에 랜드마크를 이어 붙인다 — `_build_merge_filter`가 영상 프레임에 적용하는
+    편집과 프레임 단위로 일치해야 스켈레톤이 화면의 실제 움직임과 맞는다."""
+    base_frames = _load_app_frames(base_hash)
+    seg_frames = _load_app_frames(seg_hash)
+    tail_offset = round(start_ms + seg_duration_ms - end_ms)
+    merged = [frame for frame in base_frames if frame["time_ms"] < start_ms]
+    merged += [{**frame, "time_ms": round(frame["time_ms"] + start_ms),
+                "image_landmarks": _remap_landmarks(frame["image_landmarks"], seg_width, seg_height, base_width, base_height)}
+               for frame in seg_frames]
+    merged += [{**frame, "time_ms": frame["time_ms"] + tail_offset} for frame in base_frames if frame["time_ms"] >= end_ms]
+    merged.sort(key=lambda frame: frame["time_ms"])
+    return merged
+
+
 @app.get("/v1/projects/{project_id}/versions/{version_id}/merged")
 def merged_version_video(project_id: str, version_id: str) -> dict:
     """이 버전의 구간 영상을 지금 작업의 원본(HEAD) 영상 안에 그 구간만큼 이어붙여서,
-    전체 안무 맥락에서 이 수정이 어떻게 보이는지 미리 볼 수 있게 한다.
+    전체 안무 맥락에서 이 수정이 어떻게 보이는지 미리 볼 수 있게 한다. 함께 반환하는
+    `frames`는 같은 순서·시간축으로 이어 붙인 랜드마크라, 재생 화면은 원본/구간 영상을
+    볼 때와 똑같은 `MotionPlayer`+`PoseOverlay`로 오버레이·스켈레톤 모드를 그릴 수 있다
+    — 합성 영상이라고 다른 재생 경험을 줄 이유가 없다.
 
-    versions/projects 테이블은 건드리지 않는다 — uploads/ 에 새 파일 하나만 만드는
-    순수 파생 산출물이라, 같은 버전을 다시 요청하면 다시 만들지 않고 캐시된 파일을 준다.
+    영상 파일(mp4)은 uploads/ 에 캐시해 두고 같은 버전을 다시 요청하면 ffmpeg 을 다시
+    돌리지 않는다. 랜드마크는 이미 있는 두 app_frames.json 을 그때그때 이어 붙이기만
+    하므로 굳이 캐시하지 않는다.
     """
     if not shutil.which("ffmpeg"): raise HTTPException(503, "서버에 ffmpeg 이 설치돼 있지 않아요.")
     project = store.get_project(project_id)
@@ -598,11 +698,12 @@ def merged_version_video(project_id: str, version_id: str) -> dict:
     seg_path = UPLOADS_PATH / Path(row["video_url"]).name
     if not seg_path.exists(): raise HTTPException(404, "구간 영상 파일을 찾을 수 없어요.")
 
+    base_meta = probe(base_path)
+    start_s, end_s = row["start_ms"] / 1000, row["end_ms"] / 1000
+
     output_path = UPLOADS_PATH / f"{base_hash}.merged.{version_id}.mp4"
     if not output_path.exists():
-        base_meta = probe(base_path)
         base_duration_s = (base_meta["frame_count"] / base_meta["fps"]) if base_meta["fps"] else 0.0
-        start_s, end_s = row["start_ms"] / 1000, row["end_ms"] / 1000
         filter_complex = _build_merge_filter(
             start_s, end_s, base_duration_s, base_meta["width"], base_meta["height"], base_meta["fps"])
         cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(base_path), "-i", str(seg_path),
@@ -613,7 +714,17 @@ def merged_version_video(project_id: str, version_id: str) -> dict:
         if done.returncode != 0 or not output_path.exists():
             output_path.unlink(missing_ok=True)
             raise HTTPException(502, f"영상을 합치지 못했어요: {done.stderr.decode('utf-8', 'ignore')[:300]}")
-    return {"url": f"/uploads/{output_path.name}"}
+
+    # 실제 ffmpeg 이 이어붙이는 구간 영상 길이는 DB의 duration_ms(클라이언트가 채워 넣지
+    # 않으면 비어 있을 수 있다)가 아니라 그 파일 자체다 — 같은 값을 여기서 다시 잰다.
+    seg_meta = probe(seg_path)
+    seg_duration_ms = (seg_meta["frame_count"] / seg_meta["fps"] * 1000) if seg_meta["fps"] else (end_s - start_s) * 1000
+    merged_frames = _build_merged_frames(
+        base_hash, row["source_sha256"], row["start_ms"], row["end_ms"], seg_duration_ms,
+        seg_meta["width"], seg_meta["height"], base_meta["width"], base_meta["height"])
+
+    return {"url": f"/uploads/{output_path.name}",
+            "width": base_meta["width"], "height": base_meta["height"], "frames": merged_frames}
 
 
 @app.post("/v1/projects/{project_id}/versions/{version_id}/head")

@@ -56,3 +56,5 @@ supabase/.temp/
 
 # 로컬 환경 변수 (비밀은 없지만 관례상 제외, .env.example 참고)
 .env
+.vercel
+.env*

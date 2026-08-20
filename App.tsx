@@ -14,7 +14,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import Svg, { Circle, Line } from 'react-native-svg';
 
-type Page = 'home' | 'library' | 'new' | 'capture' | 'version' | 'overlay' | 'data' | 'analysis' | 'motion' | 'collab' | 'perform' | 'profile' | 'community' | 'license' | 'passport' | 'live' | 'youtube' | 'formation' | 'practiceLog';
+type Page = 'home' | 'library' | 'new' | 'capture' | 'version' | 'overlay' | 'data' | 'analysis' | 'motion' | 'collab' | 'perform' | 'profile' | 'community' | 'license' | 'passport' | 'live' | 'youtube' | 'formation' | 'practiceLog' | 'admin';
 type PracticeRun = {
   id: string; projectId: string; userId: string; userName: string | null; referenceVersionId: string | null;
   sourceSha256: string | null; videoUrl: string | null; videoWidth: number | null; videoHeight: number | null;
@@ -75,6 +75,13 @@ type JobStage = 'uploading' | 'analyzing' | 'rendering' | 'encoding' | 'done' | 
 type JobProgress = { stage: JobStage; done: number; total: number; error?: string };
 
 const MEDIAPIPE_API_URL = process.env.EXPO_PUBLIC_MEDIAPIPE_API_URL;
+// 로컬 개발 중엔 위 env 값 하나만 쓴다. 그 값이 없는 프로덕션 빌드(Vercel)에서는 kro.kr과
+// duckdns 두 후보를 두고 실제로 응답하는 쪽을 골라 쓴다 — kro.kr 인증서가 나중에 발급돼도
+// 앱을 다시 배포할 필요 없이 자동으로 그쪽으로 넘어간다(주기적으로, 그리고 요청이 실패할
+// 때마다 다시 확인).
+const API_CANDIDATES = MEDIAPIPE_API_URL
+  ? [MEDIAPIPE_API_URL]
+  : ['https://api.choreohub.kro.kr', 'https://choreohub-api.duckdns.org'];
 
 // ChoreoHub is a living archive, not a developer dashboard.  The palette keeps
 // the page tactile and editorial while the blue carries the provenance signal.
@@ -89,22 +96,49 @@ const permissionCopy: Record<CollabPermission, string> = {
 
 /* ══════════ 서버 통신 ══════════ */
 
-const API = MEDIAPIPE_API_URL ?? '';
+let API = API_CANDIDATES[0] ?? '';
+
+async function pingApiBase(base: string): Promise<boolean> {
+  try { return (await fetch(`${base}/health`)).ok; } catch { return false; }
+}
+
+/** 후보를 우선순위 순서로 다시 확인해서 지금 실제로 응답하는 곳으로 API 를 바꾼다. */
+async function resolveApiBase(): Promise<boolean> {
+  for (const candidate of API_CANDIDATES) {
+    if (await pingApiBase(candidate)) { API = candidate; return true; }
+  }
+  return false;
+}
+
+if (typeof window !== 'undefined' && API_CANDIDATES.length > 1) {
+  resolveApiBase();
+  setInterval(resolveApiBase, 5 * 60 * 1000);
+}
 
 async function api(path: string, init?: { method?: string; body?: any }) {
-  const response = await fetch(`${API}${path}`, {
-    method: init?.method ?? 'GET',
-    headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
-    body: init?.body ? JSON.stringify(init.body) : undefined,
-  });
-  const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
-  if (!response.ok) {
-    const error: any = new Error(data?.detail ?? '요청이 실패했어요.');
-    error.status = response.status;
+  const run = async () => {
+    const response = await fetch(`${API}${path}`, {
+      method: init?.method ?? 'GET',
+      headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
+      body: init?.body ? JSON.stringify(init.body) : undefined,
+    });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : null;
+    if (!response.ok) {
+      const error: any = new Error(data?.detail ?? '요청이 실패했어요.');
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  };
+  try {
+    return await run();
+  } catch (error: any) {
+    // 서버가 응답은 했다면(HTTP 에러) 후보를 바꿀 이유가 없다 — 연결 자체가 안 됐을 때만.
+    if (error?.status || API_CANDIDATES.length <= 1) throw error;
+    if (await resolveApiBase()) return run();
     throw error;
   }
-  return data;
 }
 
 // 표시 이름만으로 신원을 만든다. 웹은 localStorage 에 남겨 새로고침해도 같은 사람으로
@@ -116,6 +150,17 @@ const loadMe = (): Me | null => {
 };
 const saveMe = (me: Me | null) => {
   try { me ? globalThis.localStorage?.setItem(ME_KEY, JSON.stringify(me)) : globalThis.localStorage?.removeItem(ME_KEY); }
+  catch {}
+};
+
+// 관리자 토큰 — 일반 로그인(me)과 완전히 분리된 별도 신원이다. 이름만으로 되는 일반
+// 로그인엔 비밀번호가 없어서, 삭제 같은 파괴적 동작을 그 위에 얹을 수 없다.
+const ADMIN_TOKEN_KEY = 'choreohub.admin';
+const loadAdminToken = (): string | null => {
+  try { return globalThis.localStorage?.getItem(ADMIN_TOKEN_KEY) ?? null; } catch { return null; }
+};
+const saveAdminToken = (token: string | null) => {
+  try { token ? globalThis.localStorage?.setItem(ADMIN_TOKEN_KEY, token) : globalThis.localStorage?.removeItem(ADMIN_TOKEN_KEY); }
   catch {}
 };
 
@@ -384,6 +429,87 @@ export default function App() {
   const [page, setPage] = useState<Page>('home');
   const [me, setMe] = useState<Me | null>(loadMe);
   const [signInName, setSignInName] = useState('');
+
+  // 관리자 — me 와 완전히 분리된 별도 신원(토큰). 게시물·사용자 삭제처럼 소유권 검사를
+  // 건너뛰는 파괴적 동작이라 서버가 ADMIN_TOKEN 환경변수로 따로 검사한다.
+  const [adminToken, setAdminToken] = useState<string | null>(loadAdminToken);
+  const [adminTokenDraft, setAdminTokenDraft] = useState('');
+  const [adminError, setAdminError] = useState<string | null>(null);
+  const [adminTab, setAdminTab] = useState<'projects' | 'users' | 'practice'>('projects');
+  const [adminUsers, setAdminUsers] = useState<any[] | 'loading' | 'error' | null>(null);
+  const [adminProjects, setAdminProjects] = useState<any[] | 'loading' | 'error' | null>(null);
+  const [adminPractice, setAdminPractice] = useState<any[] | 'loading' | 'error' | null>(null);
+  const [adminConfirmId, setAdminConfirmId] = useState<string | null>(null);
+  const [adminConfirmText, setAdminConfirmText] = useState('');
+
+  const adminApi = async (path: string, init?: { method?: string }) => {
+    const response = await fetch(`${API}${path}`, { method: init?.method ?? 'GET', headers: { 'X-Admin-Token': adminToken ?? '' } });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : null;
+    if (!response.ok) {
+      if (response.status === 403) { saveAdminToken(null); setAdminToken(null); }
+      const error: any = new Error(data?.detail ?? '요청이 실패했어요.');
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  };
+
+  const verifyAdminToken = async (token: string) => {
+    setAdminError(null);
+    try {
+      const response = await fetch(`${API}/v1/admin/verify`, { method: 'POST', headers: { 'X-Admin-Token': token } });
+      if (!response.ok) { setAdminError('토큰이 올바르지 않아요.'); return; }
+      saveAdminToken(token); setAdminToken(token); setAdminTokenDraft('');
+    } catch { setAdminError('서버에 연결하지 못했어요.'); }
+  };
+
+  const adminLogout = () => {
+    saveAdminToken(null); setAdminToken(null);
+    setAdminUsers(null); setAdminProjects(null); setAdminPractice(null);
+    setAdminTab('projects'); setAdminConfirmId(null); setAdminConfirmText('');
+  };
+
+  useEffect(() => {
+    if (page !== 'admin' || !adminToken) return;
+    if (adminTab === 'users' && adminUsers === null) {
+      setAdminUsers('loading');
+      adminApi('/v1/admin/users').then(d => setAdminUsers(d?.users ?? [])).catch(() => setAdminUsers('error'));
+    }
+    if (adminTab === 'projects' && adminProjects === null) {
+      setAdminProjects('loading');
+      adminApi('/v1/admin/projects').then(d => setAdminProjects(d?.projects ?? [])).catch(() => setAdminProjects('error'));
+    }
+    if (adminTab === 'practice' && adminPractice === null) {
+      setAdminPractice('loading');
+      adminApi('/v1/admin/practice').then(d => setAdminPractice(d?.runs ?? [])).catch(() => setAdminPractice('error'));
+    }
+  }, [page, adminToken, adminTab]);
+
+  const adminDeleteUser = async (row: any) => {
+    try {
+      await adminApi(`/v1/admin/users/${row.userId}`, { method: 'DELETE' });
+      setAdminUsers(prev => Array.isArray(prev) ? prev.filter(x => x.userId !== row.userId) : prev);
+      notify('처리했어요', row.name, 'ok');
+    } catch (error: any) { notify('삭제하지 못했어요', error?.message ?? ''); }
+    finally { setAdminConfirmId(null); setAdminConfirmText(''); }
+  };
+  const adminDeleteProject = async (row: any) => {
+    try {
+      await adminApi(`/v1/admin/projects/${row.id}`, { method: 'DELETE' });
+      setAdminProjects(prev => Array.isArray(prev) ? prev.filter(x => x.id !== row.id) : prev);
+      notify('삭제했어요', row.name, 'ok');
+    } catch (error: any) { notify('삭제하지 못했어요', error?.message ?? ''); }
+    finally { setAdminConfirmId(null); setAdminConfirmText(''); }
+  };
+  const adminDeletePractice = async (row: any) => {
+    try {
+      await adminApi(`/v1/admin/practice/${row.id}`, { method: 'DELETE' });
+      setAdminPractice(prev => Array.isArray(prev) ? prev.filter(x => x.id !== row.id) : prev);
+      notify('삭제했어요', row.projectName, 'ok');
+    } catch (error: any) { notify('삭제하지 못했어요', error?.message ?? ''); }
+    finally { setAdminConfirmId(null); setAdminConfirmText(''); }
+  };
   const [remoteProjects, setRemoteProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [serverError, setServerError] = useState('');
@@ -777,7 +903,10 @@ export default function App() {
   // 영상이 바뀌어도 예전 스켈레톤을 계속 그린다 (길이가 다르면 눈에 크게 튄다).
   const [projectFrames, setProjectFrames] = useState<{ key: string; frames: MotionFrame[] }>({ key: '', frames: [] });
   const playbackRef = useRef(0); const liveFrameRef = useRef(0);
-  const go = (p: Page) => setPage(p); const open = (p: Project) => { setSelectedId(p.id); setLicense(p.license); go('version'); };
+  const go = (p: Page) => setPage(p);
+  // 보고 있던 버전/합성 미리보기는 그 프로젝트에만 유효하다 — 다른 프로젝트로 넘어갈 때
+  // 지우지 않으면 새 프로젝트의 제목 아래에서 이전 프로젝트의 영상이 그대로 재생된다.
+  const open = (p: Project) => { setSelectedId(p.id); setLicense(p.license); setViewingVersion(null); setMergedPreview(null); go('version'); };
   const stageLabel = (stage: JobStage, done: number, total: number) => stage === 'uploading' ? '영상을 올리는 중이에요'
     : stage === 'analyzing' ? `관절을 읽는 중이에요 · ${done}/${total || '?'} 프레임`
     : stage === 'rendering' ? '기록한 관절을 정리하는 중이에요'
@@ -793,46 +922,64 @@ export default function App() {
    * 원작 게시와 수정 제안이 같은 파이프라인을 쓴다 — 구현이 둘로 갈라지면 한쪽만 고쳐지는
    * 일이 생긴다. 상태는 호출한 쪽이 각자 들고 있어서 두 흐름이 서로를 건드리지 않는다.
    */
+  // `isCurrent` 는 이 업로드가 아직도 "지금 화면이 기다리는 업로드"인지 매번 다시 확인한다.
+  // 사용자가 분석이 끝나기 전에 다른 영상을 골라 다시 부르면, 먼저 시작한(느린) 업로드의
+  // 응답이 나중에 도착해 더 새 영상의 asset/motionRef 를 덮어써 버렸다 — 두 영상이 뒤섞여
+  // 재생되는 원인 중 하나였다. 매 콜백 직전 다시 확인해서 추월당한 호출은 조용히 버린다.
   const uploadForAnalysis = async (asset: MotionAsset, onStage: (job: JobProgress) => void,
-                                   onStarted: (started: any) => void, onDone: (result: any) => void) => {
-    onStage({ stage: 'uploading', done: 0, total: 0 });
-    if (!MEDIAPIPE_API_URL) {
-      onStage({ stage: 'error', done: 0, total: 0, error: '분석 서버 주소가 설정되지 않았어요.' });
+                                   onStarted: (started: any) => void, onDone: (result: any) => void,
+                                   isCurrent: () => boolean = () => true) => {
+    const stage = (value: JobProgress) => { if (isCurrent()) onStage(value); };
+    stage({ stage: 'uploading', done: 0, total: 0 });
+    if (!API_CANDIDATES.length) {
+      stage({ stage: 'error', done: 0, total: 0, error: '분석 서버 주소가 설정되지 않았어요.' });
       return;
     }
     let started: any;
-    try {
+    const postJob = async () => {
       const data = new FormData();
       if (typeof window !== 'undefined') {
         const file = (asset.webFile ?? await fetch(asset.uri).then(response => response.blob())) as Blob;
         data.append('video', file, asset.fileName);
       } else data.append('video', { uri: asset.uri, name: asset.fileName, type: asset.mimeType } as any);
-      const response = await fetch(`${MEDIAPIPE_API_URL}/v1/jobs`, { method: 'POST', body: data });
+      const response = await fetch(`${API}/v1/jobs`, { method: 'POST', body: data });
       if (!response.ok) throw new Error('업로드 실패');
-      started = await response.json();
+      return response.json();
+    };
+    try {
+      try { started = await postJob(); }
+      catch (err) {
+        if (API_CANDIDATES.length > 1 && (await resolveApiBase())) started = await postJob();
+        else throw err;
+      }
     } catch {
-      onStage({ stage: 'error', done: 0, total: 0, error: '분석 서버에 연결하지 못했어요. 네트워크와 서버 상태를 확인해 주세요.' });
+      stage({ stage: 'error', done: 0, total: 0, error: '분석 서버에 연결하지 못했어요. 네트워크와 서버 상태를 확인해 주세요.' });
       return;
     }
+    if (!isCurrent()) return;
     onStarted(started);
-    onStage({ stage: 'analyzing', done: 0, total: started.frame_count ?? 0 });
+    stage({ stage: 'analyzing', done: 0, total: started.frame_count ?? 0 });
     for (;;) {
       await new Promise(done => setTimeout(done, 600));
+      if (!isCurrent()) return;
       let status: any;
-      try { status = await (await fetch(`${MEDIAPIPE_API_URL}/v1/jobs/${started.job_id}`)).json(); }
-      catch { onStage({ stage: 'error', done: 0, total: 0, error: '진행 상황을 받아오지 못했어요.' }); return; }
-      if (status.state === 'error') { onStage({ stage: 'error', done: 0, total: 0, error: status.error ?? '분석에 실패했어요.' }); return; }
+      try { status = await (await fetch(`${API}/v1/jobs/${started.job_id}`)).json(); }
+      catch { stage({ stage: 'error', done: 0, total: 0, error: '진행 상황을 받아오지 못했어요.' }); return; }
+      if (!isCurrent()) return;
+      if (status.state === 'error') { stage({ stage: 'error', done: 0, total: 0, error: status.error ?? '분석에 실패했어요.' }); return; }
       if (status.state === 'done') {
         const result = status.result ?? {};
         onDone(result);
-        onStage({ stage: 'done', done: result.frame_count ?? 0, total: result.frame_count ?? 0 });
+        stage({ stage: 'done', done: result.frame_count ?? 0, total: result.frame_count ?? 0 });
         return;
       }
-      onStage({ stage: (status.stage ?? 'analyzing') as JobStage, done: status.done ?? 0, total: status.total ?? 0 });
+      stage({ stage: (status.stage ?? 'analyzing') as JobStage, done: status.done ?? 0, total: status.total ?? 0 });
     }
   };
 
+  const assetUploadGen = useRef(0);
   const processMotion = async (nextAsset: MotionAsset) => {
+    const generation = ++assetUploadGen.current;
     setAsset(nextAsset); setMotionFrames([]); setPoseFrames(0); setPreviewUrls({});
     setVideoSize(null); setMotionRef(null); setPendingPublish(false);
     await uploadForAnalysis(nextAsset, setJob,
@@ -854,12 +1001,15 @@ export default function App() {
         setMotionFrames(result.frames ?? []); setPoseFrames(result.frame_count ?? 0);
         if (result.width && result.height) setVideoSize({ width: result.width, height: result.height });
         setMotionRef(current => ({ ...(current ?? {}), frame_count: result.frame_count ?? 0 }));
-      });
+      },
+      () => assetUploadGen.current === generation);
   };
 
   /* ── 제안에 영상 첨부 ── */
 
+  const proposeUploadGen = useRef(0);
   const attachProposalVideo = async (nextAsset: MotionAsset) => {
+    const generation = ++proposeUploadGen.current;
     setProposeAsset(nextAsset); setProposeMotion(null);
     await uploadForAnalysis(nextAsset, setProposeJob,
       started => {
@@ -874,7 +1024,8 @@ export default function App() {
           return autoTo ? { ...draft, to: autoTo } : draft;
         });
       },
-      result => setProposeMotion(current => ({ ...(current ?? {}), frame_count: result.frame_count ?? 0 })));
+      result => setProposeMotion(current => ({ ...(current ?? {}), frame_count: result.frame_count ?? 0 })),
+      () => proposeUploadGen.current === generation);
   };
 
   const chooseProposalVideo = async () => {
@@ -885,7 +1036,7 @@ export default function App() {
       mimeType: file.mimeType ?? 'video/mp4', duration: file.duration, source: 'library', webFile: file.file });
   };
 
-  const clearProposalVideo = () => { setProposeAsset(null); setProposeJob(null); setProposeMotion(null); };
+  const clearProposalVideo = () => { proposeUploadGen.current++; setProposeAsset(null); setProposeJob(null); setProposeMotion(null); };
 
   const chooseVideo = async () => { const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['videos'], allowsEditing: false }); if (!result.canceled) { const file = result.assets[0]; await processMotion({ uri: file.uri, fileName: file.fileName ?? `choreo-${Date.now()}.mp4`, mimeType: file.mimeType ?? 'video/mp4', duration: file.duration, source: 'library', webFile: file.file }); } };
   const toggleRecording = async () => { if (!cameraPermission?.granted) { const permission = await requestCameraPermission(); if (!permission.granted) return; } if (!cameraRef.current) return; if (recording) { cameraRef.current.stopRecording(); return; } setRecording(true); try { const video = await cameraRef.current.recordAsync({ maxDuration: 60 }); if (video?.uri) await processMotion({ uri: video.uri, fileName: `choreo-${Date.now()}.mp4`, mimeType: 'video/mp4', source: 'camera' }); } finally { setRecording(false); } };
@@ -1067,22 +1218,35 @@ export default function App() {
   const openVersionClip = (version: VersionEntry) => {
     if (!version.sourceSha256) return notify('이 버전에는 영상이 없어요', '메모와 구간만 기록된 버전입니다.');
     setViewingVersion(version);
+    setMergedPreview(null);
     playbackRef.current = 0; liveFrameRef.current = 0;
     setStageMode(stageMode === 'original' ? 'overlay' : stageMode);
     go('overlay');
   };
 
   // 원본 영상 + 이 버전의 구간 영상을 실제로 이어붙인 하나의 영상을 만들어(서버가 ffmpeg 으로
-  // 합성) 그 자리에서 재생한다. "구간 영상 보기"는 그 구간만 따로 보여주는 것과 다르다 —
-  // 이건 이 수정이 작품 전체 흐름 안에서 어떻게 보이는지 미리 보는 것이다.
+  // 합성) 안무 영상(오버레이) 화면에서 그 자리에서 재생한다 — 파일을 따로 열어주는 게 아니라
+  // 기존 재생 화면을 그대로 재사용한다. "구간 영상 보기"는 그 구간만 따로 보여주는 것과
+  // 다르다 — 이건 이 수정이 작품 전체 흐름 안에서 어떻게 보이는지 미리 보는 것이다. 서버가
+  // 두 영상의 랜드마크도 같은 순서로 이어 붙여 함께 돌려주므로, 원본·구간 영상을 볼 때와
+  // 똑같이 오버레이/스켈레톤 모드로 볼 수 있다 — 재생 경험이 일관되어야 한다.
   const [mergingVersionId, setMergingVersionId] = useState<string | null>(null);
+  const [mergedPreview, setMergedPreview] = useState<{ url: string; frames: MotionFrame[]; size?: { width: number; height: number } } | null>(null);
   const viewMergedVersion = async (version: VersionEntry) => {
     if (!selected) return;
     setMergingVersionId(version.id);
     try {
       const result = await api(`/v1/projects/${selected.id}/versions/${version.id}/merged`);
       if (!result?.url) throw new Error('합친 영상을 만들지 못했어요.');
-      await Linking.openURL(new URL(result.url, API).toString());
+      setViewingVersion(version);
+      setMergedPreview({
+        url: new URL(result.url, API).toString(),
+        frames: result.frames ?? [],
+        size: result.width && result.height ? { width: result.width, height: result.height } : undefined,
+      });
+      playbackRef.current = 0; liveFrameRef.current = 0;
+      setStageMode(stageMode === 'original' ? 'overlay' : stageMode);
+      go('overlay');
     } catch (error: any) {
       notify('합친 영상을 보지 못했어요', error?.message ?? '다시 시도해 주세요.');
     } finally {
@@ -1092,6 +1256,7 @@ export default function App() {
 
   const closeVersionClip = () => {
     setViewingVersion(null);
+    setMergedPreview(null);
     playbackRef.current = 0; liveFrameRef.current = 0;
   };
 
@@ -1193,6 +1358,15 @@ export default function App() {
     if (!wanted) return notify('이름이 필요해요', '다른 참여자에게 보일 이름을 적어 주세요.');
     setBusy(true);
     try {
+      // 닉네임 칸에 관리자 토큰을 넣으면 화면을 따로 두지 않고 바로 관리자로 들어간다.
+      // 실제 비교는 항상 서버(ADMIN_TOKEN)에서만 하므로, 토큰 값 자체는 클라이언트에 없다 —
+      // "이 값이 관리자 토큰인가?"를 서버에 물어보고, 아니면 평범한 이름으로 넘어간다.
+      const adminCheck = await fetch(`${API}/v1/admin/verify`, { method: 'POST', headers: { 'X-Admin-Token': wanted } }).catch(() => null);
+      if (adminCheck?.ok) {
+        saveAdminToken(wanted); setAdminToken(wanted); setSignInName('');
+        go('admin');
+        return;
+      }
       const created: Me = await api('/v1/users', { method: 'POST', body: { name: wanted } });
       saveMe(created); setMe(created); setSignInName(''); await refresh(created.user_id); go('home');
     } catch (error: any) { setServerError(error?.message ?? '서버에 연결하지 못했어요.'); }
@@ -1207,7 +1381,8 @@ export default function App() {
     setBusy(true);
     try {
       const project: Project = await api(`/v1/invites/${encodeURIComponent(code)}/join`, { method: 'POST', body: { user_id: me.user_id } });
-      setJoinCode(''); await refresh(); setSelectedId(project.id); setLicense(project.license); go('version');
+      setJoinCode(''); await refresh(); setSelectedId(project.id); setLicense(project.license);
+      setViewingVersion(null); setMergedPreview(null); go('version');
     } catch (error: any) { notify('참여하지 못했어요', error?.message ?? '초대 코드를 확인해 주세요.'); }
     finally { setBusy(false); }
   };
@@ -1275,7 +1450,9 @@ export default function App() {
       await refresh();
       setSelectedId(created.id);
       setProjectFrames({ key: '', frames: [] });
+      setViewingVersion(null); setMergedPreview(null);
       setOverlayIndex(0); playbackRef.current = 0; liveFrameRef.current = 0; setStageMode('overlay');
+      assetUploadGen.current++;
       setName(''); setAsset(null); setJob(null); setPendingPublish(false); setPoseFrames(0);
       setMotionFrames([]); setPreviewUrls({}); setVideoSize(null); setMotionRef(null);
       go('version');
@@ -1306,7 +1483,7 @@ export default function App() {
   // 이 시트는 무엇이 기록되는지만 알려 주는 시작점이다.
   const CreateModal = () => <Modal visible={modal} transparent animationType="slide" onRequestClose={() => setModal(false)}><Pressable style={s.overlay} onPress={() => setModal(false)}><Pressable style={s.sheet} onPress={() => {}}><View style={s.handle}/><Text style={s.sheetTitle}>새 안무 프로젝트</Text>
     {[['영상을 올리면 바로 분석이 시작돼요','기다리는 동안 제목과 공유 범위를 정할 수 있어요'],['33개 관절을 3D로 기록해요','원본 위에 겹쳐 보거나 스켈레톤만 볼 수 있어요'],['버전과 기여가 함께 남아요','Fork와 공동작업이 원작과 이어집니다']].map(([title, copy], index) => <View style={s.step} key={title}><Text style={s.stepNo}>0{index+1}</Text><View style={s.grow}><Text style={s.tipTitle}>{title}</Text><Text style={s.meta}>{copy}</Text></View></View>)}
-    <Pressable style={s.primary} onPress={() => { setModal(false); setName(''); setAsset(null); setJob(null); go('new'); }}><Text style={s.primaryText}>영상 올리고 시작하기</Text></Pressable></Pressable></Pressable></Modal>;
+    <Pressable style={s.primary} onPress={() => { setModal(false); setName(''); assetUploadGen.current++; setAsset(null); setJob(null); go('new'); }}><Text style={s.primaryText}>영상 올리고 시작하기</Text></Pressable></Pressable></Pressable></Modal>;
   const AnalysisCard = () => {
     if (!job) return null;
     if (job.stage === 'error') return <View style={s.jobCard}><View style={s.jobHead}><Text style={s.jobTitle}>분석을 마치지 못했어요</Text><Pressable onPress={() => asset && processMotion(asset)}><Text style={s.jobRetry}>다시 시도</Text></Pressable></View><Text style={s.jobCopy}>{job.error}</Text><Text style={s.jobCopy}>영상은 그대로 연결돼 있어서 지금 게시해도 됩니다.</Text></View>;
@@ -1342,7 +1519,7 @@ export default function App() {
     <Pressable style={[s.primary, !asset && s.primaryDisabled, pendingPublish && processing && s.primaryPending]} onPress={publishOriginal}>
       <Text style={s.primaryText}>{!asset ? '영상을 먼저 추가해 주세요' : pendingPublish && processing ? '게시 예약됨 · 누르면 취소' : processing ? '분석 끝나면 게시하기' : '원작 버전 게시하기'}</Text>
     </Pressable>
-  </ScrollView><Bottom page="new" go={navTo} plus={()=>{ setName(''); setAsset(null); setJob(null); go('new'); }}/></SafeAreaView>;
+  </ScrollView><Bottom page="new" go={navTo} plus={()=>{ setName(''); assetUploadGen.current++; setAsset(null); setJob(null); go('new'); }}/></SafeAreaView>;
 
   const Capture = () => <SafeAreaView style={s.safe}><Header title="안무 촬영" back={() => go('new')}/><View style={s.capture}><View style={s.cameraFrame}>{cameraPermission?.granted ? <CameraView ref={cameraRef} style={s.camera} facing="front" mode="video" mirror /> : <View style={s.cameraPermission}><Text style={s.cameraPermissionText}>카메라 권한이 필요합니다.</Text><Pressable style={s.outline} onPress={requestCameraPermission}><Text style={s.outlineText}>카메라 허용</Text></Pressable></View>}<View style={s.cameraGuide}><Text style={s.cameraGuideText}>전신이 화면 안에 들어오도록 서 주세요</Text></View></View><Text style={s.captureHint}>권장 15–60초 · 고정된 카메라 · 밝은 배경</Text><Pressable style={[s.recordButton, recording && s.recording]} onPress={toggleRecording}><View style={s.recordButtonDot}/><Text style={s.recordButtonText}>{recording ? '촬영 종료' : '촬영 시작'}</Text></Pressable></View></SafeAreaView>;
   const Library = () => <SafeAreaView style={s.safe}><Header title="내 작업" back={() => go('home')}/><ScrollView contentContainerStyle={s.content}>
@@ -1555,30 +1732,36 @@ export default function App() {
   // 있던 소스 정보(제목·업로드일·포즈 프레임 수)를 여기로 가져왔다.
   const Overlay = () => {
     const clip = viewingVersion;
-    const frames = clip
+    const merged = mergedPreview;
+    const frames = merged
+      ? merged.frames
+      : clip
       ? (versionFrames.key === clip.id ? versionFrames.frames : [])
       : (projectFrames.key === framesKey ? projectFrames.frames : []);
-    const size = clip
+    const size = merged
+      ? merged.size
+      : clip
       ? (clip.videoWidth && clip.videoHeight ? { width: clip.videoWidth, height: clip.videoHeight } : undefined)
       : (selected!.videoWidth && selected!.videoHeight ? { width: selected!.videoWidth, height: selected!.videoHeight } : undefined);
-    const uri = clip?.videoUrl ? new URL(clip.videoUrl, API).toString() : mediaUriOf(selected);
+    const uri = merged?.url ?? (clip?.videoUrl ? new URL(clip.videoUrl, API).toString() : mediaUriOf(selected));
     const modes: [StageMode, string][] = [['original', '원본'], ['overlay', '오버레이'], ['skeleton', '스켈레톤만']];
     const hasMotion = frames.length > 0 && !!size;
     return <SafeAreaView style={s.safe}><Header title="안무 영상" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}>
-      <Text style={s.eyebrow}>{clip ? 'SEGMENT CLIP' : 'SOURCE & MOTION'}</Text>
-      <Text style={s.title}>{clip ? `v${clip.number} 구간 영상` : '원본 위에서 보는'}{`\n`}{clip ? clip.segment : '움직임의 흐름'}</Text>
+      <Text style={s.eyebrow}>{merged ? 'MERGED PREVIEW' : clip ? 'SEGMENT CLIP' : 'SOURCE & MOTION'}</Text>
+      <Text style={s.title}>{merged ? `v${clip!.number} 합쳐진 영상` : clip ? `v${clip.number} 구간 영상` : '원본 위에서 보는'}{`\n`}{merged ? '원본 + 이 구간' : clip ? clip.segment : '움직임의 흐름'}</Text>
       {clip ? <View style={s.clipBanner}>
-        <View style={s.grow}><Text style={s.clipBannerTitle}>{clip.title}</Text><Text style={s.clipBannerMeta}>{clip.authorName} · {clip.segment} · 포즈 {clip.poseFrames ?? 0}f</Text></View>
+        <View style={s.grow}><Text style={s.clipBannerTitle}>{clip.title}</Text><Text style={s.clipBannerMeta}>{merged ? '원본에 이 구간을 이어붙인 미리보기' : `${clip.authorName} · ${clip.segment} · 포즈 ${clip.poseFrames ?? 0}f`}</Text></View>
         <Pressable style={s.clipBannerBtn} onPress={closeVersionClip}><Text style={s.clipBannerBtnText}>작품 전체 보기</Text></Pressable>
       </View> : null}
 
       <View style={s.modeRow}>{modes.map(([value, label]) => <Pressable key={value} style={[s.modeChip, stageMode === value && s.modeChipOn, value !== 'original' && !hasMotion && s.modeChipOff]} onPress={() => setStageMode(value)}><Text style={[s.modeChipText, stageMode === value && s.modeChipTextOn]}>{label}</Text></Pressable>)}</View>
       <MotionPlayer uri={uri} frames={frames} video={size} mode={hasMotion ? stageMode : 'original'} positionRef={playbackRef} frameRef={liveFrameRef}/>
 
+      {merged ? <Text style={s.countHint}>이 영상은 저장된 기록이 아니라 미리보기예요 — 원본의 이 구간만 방금 만든 구간 영상으로 바꿔서 이어붙였습니다.</Text> : null}
       <View style={s.legend}><View style={s.legendDot}/><Text style={s.legendText}>{hasMotion ? '재생에 맞춰 33개 관절을 실시간으로 그립니다' : '아직 연결된 포즈 데이터가 없어요'}</Text><Text style={s.legendFrame}>{frames.length} frames</Text></View>
 
       <View style={s.mediaInfo}><Text style={s.mediaTitle}>{clip ? `${selected!.name} · v${clip.number}` : selected!.name}</Text><Text style={s.meta}>{clip ? `${clip.authorName} 의 구간 영상 · ${clip.date}` : `업로드 원본 · ${selected!.date} · ${selected!.ownerName}`}</Text></View>
-      <View style={s.dataSummary}><Text style={s.dataSummaryNumber}>{clip ? (clip.poseFrames ?? 0) : (selected!.poseFrames ?? 0)}</Text><Text style={s.dataSummaryCopy}>개의 포즈 프레임이{`\n`}이 영상과 연결되어 있어요</Text></View>
+      <View style={s.dataSummary}><Text style={s.dataSummaryNumber}>{merged ? frames.length : clip ? (clip.poseFrames ?? 0) : (selected!.poseFrames ?? 0)}</Text><Text style={s.dataSummaryCopy}>개의 포즈 프레임이{`\n`}이 영상과 연결되어 있어요</Text></View>
 
       {frames.length && !size ? <Text style={s.notice}>이 작업은 영상 해상도 정보가 없어 오버레이를 그릴 수 없어요. 새로 업로드하면 표시됩니다.</Text> : null}
       {hasMotion ? <Pressable style={s.secondary} onPress={() => { setOverlayIndex(liveFrameRef.current); go('data'); }}><Text style={s.secondaryText}>지금 이 프레임의 관절 데이터 보기</Text></Pressable> : null}
@@ -1853,15 +2036,56 @@ export default function App() {
         <Pressable style={s.formationChip} onPress={() => addFormationDancer(formationSection.id)}><Text style={s.formationChipText}>+ 인원 추가</Text></Pressable>
       </>}
 
-      <Text style={s.section}>격자로 한 번에 배치</Text>
-      <View style={s.gridInputsRow}>
-        <TextInput value={gridRows} onChangeText={setGridRows} keyboardType="number-pad" style={s.gridInput} placeholder="행"/>
-        <TextInput value={gridCols} onChangeText={setGridCols} keyboardType="number-pad" style={s.gridInput} placeholder="열"/>
-        <TextInput value={gridCount} onChangeText={setGridCount} keyboardType="number-pad" style={s.gridInput} placeholder="인원"/>
-        <Pressable style={s.formationChip} onPress={() => applyFormationGrid(formationSection.id, Math.max(1, Number(gridRows) || 1), Math.max(1, Number(gridCols) || 1), Math.max(1, Number(gridCount) || 1))}>
-          <Text style={s.formationChipText}>배치</Text>
-        </Pressable>
-      </View>
+      {(() => {
+        const rows = clamp(Number(gridRows) || 1, 1, 10);
+        const cols = clamp(Number(gridCols) || 1, 1, 10);
+        const count = clamp(Number(gridCount) || 1, 1, rows * cols);
+        const step = (setter: (v: string) => void, current: number, delta: number, min: number, max: number) =>
+          setter(String(clamp(current + delta, min, max)));
+        return <>
+          <Text style={s.section}>격자로 한 번에 배치</Text>
+          <Text style={s.countHint}>가로 몇 명·세로 몇 줄로 세울지 정하면, 그 칸 수만큼 댄서를 나란히 채워드려요.</Text>
+          <View style={s.gridStepperRow}>
+            <View style={s.gridStepper}>
+              <Text style={s.gridStepperLabel}>세로 줄 수</Text>
+              <View style={s.gridStepperControl}>
+                <Pressable style={s.gridStepperBtn} onPress={() => step(setGridRows, rows, -1, 1, 10)}><Text style={s.gridStepperBtnText}>−</Text></Pressable>
+                <Text style={s.gridStepperValue}>{rows}</Text>
+                <Pressable style={s.gridStepperBtn} onPress={() => step(setGridRows, rows, 1, 1, 10)}><Text style={s.gridStepperBtnText}>＋</Text></Pressable>
+              </View>
+            </View>
+            <View style={s.gridStepper}>
+              <Text style={s.gridStepperLabel}>가로 줄 수</Text>
+              <View style={s.gridStepperControl}>
+                <Pressable style={s.gridStepperBtn} onPress={() => step(setGridCols, cols, -1, 1, 10)}><Text style={s.gridStepperBtnText}>−</Text></Pressable>
+                <Text style={s.gridStepperValue}>{cols}</Text>
+                <Pressable style={s.gridStepperBtn} onPress={() => step(setGridCols, cols, 1, 1, 10)}><Text style={s.gridStepperBtnText}>＋</Text></Pressable>
+              </View>
+            </View>
+            <View style={s.gridStepper}>
+              <Text style={s.gridStepperLabel}>인원 수</Text>
+              <View style={s.gridStepperControl}>
+                <Pressable style={s.gridStepperBtn} onPress={() => step(setGridCount, count, -1, 1, rows * cols)}><Text style={s.gridStepperBtnText}>−</Text></Pressable>
+                <Text style={s.gridStepperValue}>{count}</Text>
+                <Pressable style={s.gridStepperBtn} onPress={() => step(setGridCount, count, 1, 1, rows * cols)}><Text style={s.gridStepperBtnText}>＋</Text></Pressable>
+              </View>
+            </View>
+          </View>
+
+          <View style={s.gridPreviewWrap}>
+            {Array.from({ length: rows }).map((_, r) => <View key={r} style={s.gridPreviewRow}>
+              {Array.from({ length: cols }).map((_, c) => {
+                const filled = r * cols + c < count;
+                return <View key={c} style={[s.gridPreviewDot, filled && s.gridPreviewDotOn]}/>;
+              })}
+            </View>)}
+          </View>
+
+          <Pressable style={s.primary} onPress={() => applyFormationGrid(formationSection.id, rows, cols, count)}>
+            <Text style={s.primaryText}>이 격자로 무대 채우기</Text>
+          </Pressable>
+        </>;
+      })()}
 
       <Text style={s.section}>댄서 목록</Text>
       {formationSection.formation.dancers.map(d => <View key={d.id} style={s.overlayRow}>
@@ -1891,6 +2115,60 @@ export default function App() {
         {run.videoUrl ? <Pressable style={s.formationChip} onPress={() => Linking.openURL(new URL(run.videoUrl!, API).toString())}><Text style={s.formationChipText}>녹화 다시 보기</Text></Pressable> : null}
       </View>) : null}
     </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  };
+  const Admin = () => {
+    if (!adminToken) {
+      return <SafeAreaView style={s.safe}><Header title="관리자" back={() => go('profile')}/><ScrollView contentContainerStyle={s.content}>
+        <Text style={s.eyebrow}>ADMIN</Text>
+        <Text style={s.title}>관리자 토큰을{`\n`}입력하세요</Text>
+        <Text style={s.countHint}>일반 로그인과 완전히 다른 신원이에요 — 삭제 같은 파괴적 동작을 위한 별도 토큰입니다.</Text>
+        {adminError ? <View style={s.compareBaseCard}><Text style={s.meta}>{adminError}</Text></View> : null}
+        <TextInput placeholder="관리자 토큰" placeholderTextColor="#6E7C86" value={adminTokenDraft} onChangeText={setAdminTokenDraft} secureTextEntry autoCapitalize="none" style={s.input}/>
+        <Pressable style={s.primary} onPress={() => verifyAdminToken(adminTokenDraft)}><Text style={s.primaryText}>확인</Text></Pressable>
+      </ScrollView></SafeAreaView>;
+    }
+    const rows = adminTab === 'users' ? adminUsers : adminTab === 'projects' ? adminProjects : adminPractice;
+    return <SafeAreaView style={s.safe}><Header title="관리자" back={() => go('profile')}/><ScrollView contentContainerStyle={s.content}>
+      <Text style={s.eyebrow}>ADMIN</Text>
+      <Text style={s.title}>운영 관리</Text>
+      <View style={s.chipsRow}>
+        <Pressable style={[s.formationChip, adminTab === 'projects' && s.formationChipOn]} onPress={() => setAdminTab('projects')}><Text style={[s.formationChipText, adminTab === 'projects' && s.formationChipTextOn]}>작업</Text></Pressable>
+        <Pressable style={[s.formationChip, adminTab === 'users' && s.formationChipOn]} onPress={() => setAdminTab('users')}><Text style={[s.formationChipText, adminTab === 'users' && s.formationChipTextOn]}>사용자</Text></Pressable>
+        <Pressable style={[s.formationChip, adminTab === 'practice' && s.formationChipOn]} onPress={() => setAdminTab('practice')}><Text style={[s.formationChipText, adminTab === 'practice' && s.formationChipTextOn]}>연습 기록</Text></Pressable>
+      </View>
+
+      {rows === 'loading' ? <Text style={s.meta}>불러오는 중…</Text> : null}
+      {rows === 'error' ? <Text style={s.meta}>불러오지 못했어요.</Text> : null}
+      {Array.isArray(rows) && rows.length === 0 ? <Text style={s.meta}>없어요.</Text> : null}
+
+      {Array.isArray(rows) ? rows.map((row: any) => {
+        const id = adminTab === 'users' ? row.userId : row.id;
+        const label = adminTab === 'users' ? row.name : adminTab === 'projects' ? row.name : `${row.userName} · ${row.projectName}`;
+        const confirmTarget = adminTab === 'practice' ? '삭제' : label;
+        const confirming = adminConfirmId === id;
+        return <View key={id} style={s.compareBaseCard}>
+          <Text style={s.compareBaseTitle}>{label}</Text>
+          {adminTab === 'users' ? <Text style={s.meta}>소유 {row.ownedProjects} · 참여 {row.joinedProjects} · {row.createdAt}</Text> : null}
+          {adminTab === 'projects' ? <Text style={s.meta}>{row.ownerName} · {row.license} · 버전 {row.versions} · 참여자 {row.collaborators} · {row.createdAt}</Text> : null}
+          {adminTab === 'practice' ? <Text style={s.meta}>일치율 {row.overallScore != null ? Math.round(row.overallScore) : '?'}% · {row.createdAt}</Text> : null}
+          {confirming ? <>
+            <Text style={s.label}>확인을 위해 "{confirmTarget}" 을 입력</Text>
+            <TextInput placeholder={confirmTarget} placeholderTextColor="#6E7C86" value={adminConfirmText} onChangeText={setAdminConfirmText} style={s.input}/>
+            <View style={s.gridInputsRow}>
+              <Pressable style={s.headBtn} onPress={() => { setAdminConfirmId(null); setAdminConfirmText(''); }}><Text style={s.headBtnText}>취소</Text></Pressable>
+              <Pressable style={[s.danger, adminConfirmText.trim() !== confirmTarget && s.primaryDisabled]} onPress={() => {
+                if (adminConfirmText.trim() !== confirmTarget) return;
+                if (adminTab === 'users') adminDeleteUser(row);
+                else if (adminTab === 'projects') adminDeleteProject(row);
+                else adminDeletePractice(row);
+              }}><Text style={s.dangerText}>영구 삭제</Text></Pressable>
+            </View>
+          </> : <Pressable style={s.danger} onPress={() => { setAdminConfirmId(id); setAdminConfirmText(''); }}><Text style={s.dangerText}>삭제</Text></Pressable>}
+        </View>;
+      }) : null}
+
+      <Pressable style={s.secondary} onPress={adminLogout}><Text style={s.secondaryText}>관리자 로그아웃</Text></Pressable>
+    </ScrollView><Bottom page="profile" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
   };
   const CollabSheet = () => {
     if (!collabEditing) return null;
@@ -2022,7 +2300,8 @@ export default function App() {
 
       {mine ? <><Text style={s.section}>설정</Text>
       <Pressable style={s.setting} onPress={()=>go('license')}><Text style={s.settingIcon}>⚙</Text><View style={s.grow}><Text style={s.versionTitle}>기본 이용 허락 범위</Text><Text style={s.meta}>작품마다 세부 설정 가능</Text></View><Text style={s.chev}>›</Text></Pressable>
-      <Pressable style={s.danger} onPress={signOut}><Text style={s.dangerText}>이 기기에서 로그아웃</Text></Pressable></> : null}
+      <Pressable style={s.danger} onPress={signOut}><Text style={s.dangerText}>이 기기에서 로그아웃</Text></Pressable>
+      <Pressable style={s.adminLink} onPress={() => go('admin')}><Text style={s.adminLinkText}>관리자</Text></Pressable></> : null}
     </ScrollView><Bottom page="profile" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
   };
 
@@ -2262,7 +2541,7 @@ export default function App() {
   };
   const RecordGroup = ({title,items}:{title:string;items:string[]}) => <View style={s.recordGroup}><Text style={s.recordGroupTitle}>{title}</Text>{items.map(item=><View key={item} style={s.recordItem}><Text style={s.recordCheck}>✓</Text><Text style={s.recordItemText}>{item}</Text><Text style={s.recordArrow}>›</Text></View>)}</View>;
   const LicenseSettings = () => <SafeAreaView style={s.safe}><Header title="라이선스 설정" back={()=>go('profile')}/><ScrollView contentContainerStyle={s.content}><Text style={s.eyebrow}>DEFAULT PERMISSION</Text><Text style={s.title}>내 안무를 어떻게{`\n`}사용할 수 있나요?</Text>{(Object.keys(licenseColor) as License[]).map(item=><Pressable key={item} style={[s.license,license===item&&s.licenseOn]} onPress={()=>setLicense(item)}><View style={[s.radio,license===item&&{borderColor:licenseColor[item]}]}>{license===item&&<View style={[s.radioIn,{backgroundColor:licenseColor[item]}]}/>}</View><View style={s.grow}><Text style={s.licenseName}>{item}</Text><Text style={s.licenseCopy}>{item==='연습 전용'?'개인 열람과 연습만 허용합니다.':item==='비상업 커버 허용'?'출처 표기 시 비상업 영상 게시가 가능합니다.':item==='리믹스 허용'?'Fork와 2차 창작을 허용합니다.':'공연·광고·교육 사용 전 승인이 필요합니다.'}</Text></View></Pressable>)}<Pressable style={s.primary} onPress={()=>{notify('저장 완료', `${license}으로 기본 라이선스를 설정했습니다.`, 'ok');go('profile');}}><Text style={s.primaryText}>기본 설정 저장</Text></Pressable></ScrollView><Bottom page="profile" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
-  const pages: Record<Page,()=>React.JSX.Element> = { home:Home,library:Library,new:New,capture:Capture,version:Version,overlay:Overlay,data:Data,analysis:Analysis,motion:Motion,collab:Collab,perform:Perform,profile:Profile,community:CommunityPage,license:LicenseSettings,passport:Passport,live:Live,youtube:Youtube,formation:Formation,practiceLog:PracticeLog }; // 페이지를 요소(<Current/>)가 아니라 함수 호출로 그린다.
+  const pages: Record<Page,()=>React.JSX.Element> = { home:Home,library:Library,new:New,capture:Capture,version:Version,overlay:Overlay,data:Data,analysis:Analysis,motion:Motion,collab:Collab,perform:Perform,profile:Profile,community:CommunityPage,license:LicenseSettings,passport:Passport,live:Live,youtube:Youtube,formation:Formation,practiceLog:PracticeLog,admin:Admin }; // 페이지를 요소(<Current/>)가 아니라 함수 호출로 그린다.
   // 이 화살표 함수들은 App 리렌더마다 새로 만들어져 요소로 쓰면 타입이 매번 바뀌고,
   // React 가 트리를 통째로 remount 한다 — 진행률 폴링(600ms)마다 영상이 처음으로
   // 되감기는 원인이었다. 함수 호출은 JSX 를 App 의 트리에 그대로 펼치므로
@@ -2295,6 +2574,10 @@ export default function App() {
 
   // 프로젝트가 있어야 열리는 화면들. 참여 중인 작업이 없으면 목록으로 돌린다.
   const needsProject: Page[] = ['version', 'overlay', 'data', 'collab'];
+  // 관리자 토큰으로 들어온 경우엔 일반 로그인(me) 없이도 관리자 화면을 바로 보여준다 —
+  // 토큰이 서버에서 더 이상 유효하지 않으면 adminApi() 가 403 을 받아 스스로 지우고
+  // 다음 렌더에서 자연스럽게 로그인 화면으로 돌아간다.
+  if (!me && adminToken) return <View style={s.app}><StatusBar style="light"/>{Admin()}{Toast()}</View>;
   if (!me) return <View style={s.app}><StatusBar style="light"/>{SignIn()}{Toast()}</View>;
   const active: Page = needsProject.includes(page) && !selected ? 'library' : page;
   return <View style={s.app}><StatusBar style="light"/>{pages[active]()}{CreateModal()}{CollabSheet()}{ProposeSheet()}{EditPostSheet()}{Toast()}</View>;
@@ -2413,7 +2696,19 @@ Object.assign(s, {
   formationDancer: { position: 'absolute', width: 32, height: 32, borderRadius: 16, backgroundColor: '#7FA5FF', alignItems: 'center', justifyContent: 'center', userSelect: 'none', touchAction: 'none' },
   formationDancerLabel: { color: '#0E1317', fontSize: 11, fontWeight: '800', userSelect: 'none' },
   gridInputsRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
-  gridInput: { width: 52, backgroundColor: '#181F26', borderWidth: 1, borderColor: '#2A333B', borderRadius: 10, color: '#E8EDF2', textAlign: 'center', paddingVertical: 8 },
+  gridStepperRow: { flexDirection: 'row', gap: 10, marginBottom: 4 },
+  gridStepper: { flex: 1, alignItems: 'center', gap: 6 },
+  gridStepperLabel: { color: '#A2AFB9', fontSize: 11.5, fontWeight: '700' },
+  gridStepperControl: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#181F26', borderWidth: 1, borderColor: '#2A333B', borderRadius: 12, paddingHorizontal: 6, paddingVertical: 4 },
+  gridStepperBtn: { width: 30, height: 30, borderRadius: 8, backgroundColor: '#202932', alignItems: 'center', justifyContent: 'center' },
+  gridStepperBtnText: { color: '#E8EDF2', fontSize: 16, fontWeight: '800' },
+  gridStepperValue: { color: '#E8EDF2', fontSize: 16, fontWeight: '800', minWidth: 22, textAlign: 'center', fontVariant: ['tabular-nums'] },
+  gridPreviewWrap: { alignItems: 'center', gap: 5, backgroundColor: '#12181D', borderWidth: 1, borderColor: '#2A333B', borderRadius: 12, paddingVertical: 14, marginBottom: 12 },
+  gridPreviewRow: { flexDirection: 'row', gap: 5 },
+  gridPreviewDot: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#2A333B' },
+  gridPreviewDotOn: { backgroundColor: '#7FA5FF' },
+  adminLink: { alignSelf: 'center', marginTop: 14, padding: 6 },
+  adminLinkText: { color: '#4A5560', fontSize: 11.5 },
   headBtn: { marginTop: 12, alignSelf: 'flex-start', borderWidth: 1, borderColor: '#33456B', borderRadius: 9, paddingHorizontal: 12, paddingVertical: 7 },
   headBtnText: { color: '#7FA5FF', fontSize: 12, fontWeight: '800' },
   growHint: { color: '#4FC7A2', fontSize: 11.5, lineHeight: 17, marginTop: 7, fontWeight: '700' },
