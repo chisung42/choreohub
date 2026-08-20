@@ -4,6 +4,9 @@
   "main": "index.ts",
   "dependencies": {
     "@expo/metro-runtime": "~57.0.10",
+    "@mediapipe/tasks-vision": "^1.0.1",
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
     "expo": "~57.0.13",
     "expo-camera": "~57.0.3",
     "expo-image-picker": "~57.0.10",
@@ -13,7 +16,8 @@
     "react-dom": "19.2.3",
     "react-native": "0.86.2",
     "react-native-svg": "15.15.4",
-    "react-native-web": "^0.21.2"
+    "react-native-web": "^0.21.2",
+    "three": "^0.185.1"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",

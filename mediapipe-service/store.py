@@ -93,6 +93,23 @@ CREATE TABLE IF NOT EXISTS follows (
 );
 CREATE INDEX IF NOT EXISTS collaborators_project ON collaborators(project_id);
 CREATE INDEX IF NOT EXISTS collaborators_user ON collaborators(user_id);
+-- 연습 기록은 versions 와 분리한다. 안무를 실제로 고친 것(수정 제안·반영)이 아니라
+-- 개인 연습 결과일 뿐이라, 여기 섞이면 협업자에게 "누가 안무를 바꿨다"는 잘못된 인상을 준다.
+CREATE TABLE IF NOT EXISTS practice_runs (
+  id                    TEXT PRIMARY KEY,
+  project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id               TEXT NOT NULL REFERENCES users(id),
+  reference_version_id  TEXT REFERENCES versions(id),
+  source_sha256         TEXT,
+  video_url             TEXT,
+  width                 INTEGER,
+  height                INTEGER,
+  frame_count           INTEGER,
+  overall_score         REAL,
+  mirrored              INTEGER NOT NULL DEFAULT 0,
+  created_at            REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS practice_runs_project ON practice_runs(project_id, user_id);
 """
 
 
@@ -484,6 +501,51 @@ def work_ms(project_id: str) -> int:
         "SELECT MAX(end_ms) AS e FROM versions WHERE project_id = ? AND state = 'merged'",
         (project_id,)).fetchone()
     return max(base, int(row["e"] or 0))
+
+
+def _practice_run_row(row: sqlite3.Row, user_name: str | None) -> dict:
+    return {
+        "id": row["id"], "projectId": row["project_id"], "userId": row["user_id"],
+        "userName": user_name, "referenceVersionId": row["reference_version_id"],
+        "sourceSha256": row["source_sha256"], "videoUrl": row["video_url"],
+        "videoWidth": row["width"], "videoHeight": row["height"], "frameCount": row["frame_count"],
+        "overallScore": row["overall_score"], "mirrored": bool(row["mirrored"]),
+        "createdAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(row["created_at"])),
+    }
+
+
+def create_practice_run(project_id: str, user_id: str, reference_version_id: str | None,
+                        motion: dict, overall_score: float | None, mirrored: bool) -> dict:
+    """연습 결과를 남긴다. versions 와 완전히 분리된 테이블이라 버전 이력·HEAD·크레딧에 전혀
+    영향을 주지 않는다 — 이건 안무를 고친 게 아니라 그냥 연습한 것이다."""
+    entry = {
+        "id": new_id(), "project_id": project_id, "user_id": user_id,
+        "reference_version_id": reference_version_id,
+        "source_sha256": motion.get("source_sha256"), "video_url": motion.get("video_url"),
+        "width": motion.get("width"), "height": motion.get("height"),
+        "frame_count": motion.get("frame_count"),
+        "overall_score": overall_score, "mirrored": 1 if mirrored else 0,
+        "created_at": time.time(),
+    }
+    connect().execute(
+        "INSERT INTO practice_runs (id, project_id, user_id, reference_version_id, source_sha256,"
+        " video_url, width, height, frame_count, overall_score, mirrored, created_at) VALUES"
+        " (:id, :project_id, :user_id, :reference_version_id, :source_sha256, :video_url, :width,"
+        " :height, :frame_count, :overall_score, :mirrored, :created_at)", entry)
+    connect().commit()
+    row = connect().execute("SELECT * FROM practice_runs WHERE id = ?", (entry["id"],)).fetchone()
+    return _practice_run_row(row, _name_of(user_id))
+
+
+def list_practice_runs(project_id: str, user_id: str | None = None) -> list[dict]:
+    query = "SELECT * FROM practice_runs WHERE project_id = ?"
+    params: list = [project_id]
+    if user_id:
+        query += " AND user_id = ?"
+        params.append(user_id)
+    query += " ORDER BY created_at DESC LIMIT 30"
+    rows = connect().execute(query, params).fetchall()
+    return [_practice_run_row(row, _name_of(row["user_id"])) for row in rows]
 
 
 def create_version(project_id: str, author_id: str, title: str, note: str,

@@ -5,13 +5,17 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import mimetypes
 import multiprocessing
 import os
 import re
 import shutil
 import subprocess
 import threading
+import time
 import traceback
+import urllib.parse
+import urllib.request
 import uuid
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -23,6 +27,8 @@ from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from google import genai
+from google.genai import types as genai_types
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -511,6 +517,28 @@ def make_version(project_id: str, user_id: str = Body(...), title: str = Body(""
             "extended": after > before if before else False, "workMsBefore": before}
 
 
+@app.post("/v1/projects/{project_id}/practice")
+def make_practice_run(project_id: str, user_id: str = Body(...), reference_version_id: str | None = Body(None),
+                      overall_score: float | None = Body(None), mirrored: bool = Body(False),
+                      motion: dict = Body(...)) -> dict:
+    """웹캠 실시간 연습 녹화를 남긴다 — versions 와 분리된 별도 기록이다.
+
+    안무를 실제로 고친 게 아니라 개인 연습일 뿐이라 버전 이력·HEAD·크레딧에는 손대지 않는다.
+    안무 수정(제안/반영)은 여전히 make_version 이 맡는다.
+    """
+    require_user(user_id)
+    project = store.get_project(project_id)
+    if not project: raise HTTPException(404, "작업을 찾을 수 없습니다.")
+    return store.create_practice_run(project_id, user_id, reference_version_id, motion, overall_score, mirrored)
+
+
+@app.get("/v1/projects/{project_id}/practice")
+def read_practice_runs(project_id: str, user_id: str | None = None) -> dict:
+    project = store.get_project(project_id)
+    if not project: raise HTTPException(404, "작업을 찾을 수 없습니다.")
+    return {"runs": store.list_practice_runs(project_id, user_id)}
+
+
 @app.get("/v1/projects/{project_id}/versions/{version_id}/frames")
 def read_version_frames(project_id: str, version_id: str) -> dict:
     """그 버전에 첨부된 클립의 랜드마크. 구간 영상만 따로 볼 때 쓴다."""
@@ -523,6 +551,69 @@ def read_version_frames(project_id: str, version_id: str) -> dict:
     if not path.exists():
         return {"width": row["width"], "height": row["height"], "frames": []}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _build_merge_filter(start_s: float, end_s: float, base_duration_s: float,
+                        width: int, height: int, fps: float) -> str:
+    """원본 영상의 [0, start_s), 구간 영상 전체, 원본 영상의 [end_s, 끝) 를 이 순서로 이어붙이는
+    ffmpeg filter_complex 를 만든다. 세 조각의 해상도·fps 가 서로 달라도(휴대폰과 웹캠처럼)
+    scale+pad+fps 로 맞춘 뒤 concat 해야 ffmpeg 이 에러 없이 이어붙인다."""
+    conform = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
+    filters = []
+    labels = []
+    if start_s > 0.05:
+        filters.append(f"[0:v]trim=start=0:end={start_s:.3f},setpts=PTS-STARTPTS,{conform}[vpre]")
+        labels.append("[vpre]")
+    filters.append(f"[1:v]setpts=PTS-STARTPTS,{conform}[vseg]")
+    labels.append("[vseg]")
+    if end_s < base_duration_s - 0.05:
+        filters.append(f"[0:v]trim=start={end_s:.3f}:end={base_duration_s:.3f},setpts=PTS-STARTPTS,{conform}[vpost]")
+        labels.append("[vpost]")
+    filters.append("".join(labels) + f"concat=n={len(labels)}:v=1:a=0[outv]")
+    return ";".join(filters)
+
+
+@app.get("/v1/projects/{project_id}/versions/{version_id}/merged")
+def merged_version_video(project_id: str, version_id: str) -> dict:
+    """이 버전의 구간 영상을 지금 작업의 원본(HEAD) 영상 안에 그 구간만큼 이어붙여서,
+    전체 안무 맥락에서 이 수정이 어떻게 보이는지 미리 볼 수 있게 한다.
+
+    versions/projects 테이블은 건드리지 않는다 — uploads/ 에 새 파일 하나만 만드는
+    순수 파생 산출물이라, 같은 버전을 다시 요청하면 다시 만들지 않고 캐시된 파일을 준다.
+    """
+    if not shutil.which("ffmpeg"): raise HTTPException(503, "서버에 ffmpeg 이 설치돼 있지 않아요.")
+    project = store.get_project(project_id)
+    if not project: raise HTTPException(404, "작업을 찾을 수 없습니다.")
+    base_hash = project.get("sourceSha256")
+    if not base_hash or not project.get("videoUrl"): raise HTTPException(404, "이 작업에는 원본 영상이 없어요.")
+    base_path = UPLOADS_PATH / Path(project["videoUrl"]).name
+    if not base_path.exists(): raise HTTPException(404, "원본 영상 파일을 찾을 수 없어요.")
+
+    row = store.connect().execute(
+        "SELECT source_sha256, video_url, start_ms, end_ms FROM versions WHERE id = ? AND project_id = ?",
+        (version_id, project_id)).fetchone()
+    if not row: raise HTTPException(404, "버전을 찾을 수 없습니다.")
+    if not row["source_sha256"] or row["start_ms"] is None or row["end_ms"] is None:
+        raise HTTPException(400, "이 버전은 구간 영상이 없거나 구간이 지정되지 않아 합칠 수 없어요.")
+    seg_path = UPLOADS_PATH / Path(row["video_url"]).name
+    if not seg_path.exists(): raise HTTPException(404, "구간 영상 파일을 찾을 수 없어요.")
+
+    output_path = UPLOADS_PATH / f"{base_hash}.merged.{version_id}.mp4"
+    if not output_path.exists():
+        base_meta = probe(base_path)
+        base_duration_s = (base_meta["frame_count"] / base_meta["fps"]) if base_meta["fps"] else 0.0
+        start_s, end_s = row["start_ms"] / 1000, row["end_ms"] / 1000
+        filter_complex = _build_merge_filter(
+            start_s, end_s, base_duration_s, base_meta["width"], base_meta["height"], base_meta["fps"])
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(base_path), "-i", str(seg_path),
+               "-filter_complex", filter_complex, "-map", "[outv]",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+               "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
+        done = subprocess.run(cmd, capture_output=True)
+        if done.returncode != 0 or not output_path.exists():
+            output_path.unlink(missing_ok=True)
+            raise HTTPException(502, f"영상을 합치지 못했어요: {done.stderr.decode('utf-8', 'ignore')[:300]}")
+    return {"url": f"/uploads/{output_path.name}"}
 
 
 @app.post("/v1/projects/{project_id}/versions/{version_id}/head")
@@ -545,6 +636,178 @@ def decide(project_id: str, version_id: str, user_id: str = Body(...), accept: b
         return store.decide_version(project_id, version_id, user_id, accept)
     except ValueError as error:
         raise HTTPException(409, str(error))
+
+
+ADVICE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "whatsWrong": {"type": "string"},
+                    "why": {"type": "string"},
+                    "howToFix": {"type": "string"},
+                },
+                "required": ["start", "end", "whatsWrong", "why", "howToFix"],
+            },
+        },
+        "overallComment": {"type": "string"},
+    },
+    "required": ["segments", "overallComment"],
+}
+
+
+def genai_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(503, "서버에 GEMINI_API_KEY가 설정되지 않았어요.")
+    return genai.Client(api_key=api_key)
+
+
+def upload_and_wait_active(client: genai.Client, video_path: Path):
+    """영상을 Gemini Files API 에 올리고 ACTIVE 상태가 될 때까지 기다린다.
+
+    팀원의 route.ts 의 uploadAndWaitActive 와 동일한 폴링 정책(90초 타임아웃)이다.
+    """
+    mime_type = mimetypes.guess_type(video_path.name)[0] or "video/mp4"
+    file = client.files.upload(file=str(video_path), config={"mime_type": mime_type})
+    started_at = time.time()
+    while str(file.state) in ("FileState.PROCESSING", "PROCESSING"):
+        if time.time() - started_at > 90:
+            raise HTTPException(502, "영상 처리 시간이 너무 오래 걸려요. 잠시 후 다시 시도해주세요.")
+        time.sleep(2)
+        file = client.files.get(name=file.name)
+    if str(file.state) not in ("FileState.ACTIVE", "ACTIVE") or not file.uri or not file.mime_type:
+        raise HTTPException(502, "영상 처리에 실패했어요. 다른 영상으로 시도해주세요.")
+    return file
+
+
+def build_numeric_prompt(segments: list[dict]) -> str:
+    """팀원의 buildNumericPrompt 를 그대로 옮긴 것 — 문구/형식을 바꾸지 않는다."""
+    lines = []
+    for i, s in enumerate(segments):
+        joints = ", ".join(f"{j['joint']}({j['avgDiffDeg']}도 차이)" for j in (s.get("worstJoints") or [])) or "특별히 두드러지는 관절 없음"
+        lines.append(f"{i + 1}. \"{s.get('label', '구간')}\" ({s['start']:.1f}초~{s['end']:.1f}초): 일치율 {s.get('score', '?')}%, 차이가 큰 관절: {joints}")
+    lines_text = "\n".join(lines)
+    return (
+        "당신은 댄스 안무 코치입니다. 첫 번째 영상은 사용자 영상이고, 두 번째는 레퍼런스 영상입니다. "
+        "아래는 두 영상의 포즈를 분석해서 이미 정확하게 계산해 둔 결과입니다.\n\n"
+        f"{lines_text}\n\n"
+        "중요: 위 수치(퍼센트, 각도 차이)는 이미 정확히 계산되어 있습니다. 새로 추정하거나 다른 숫자를 만들어내지 마세요. "
+        "이 수치를 근거로 삼되, 실제로 두 영상을 보고 무엇이 다른지, 왜 그런 차이가 나는지, 어떻게 고치면 좋을지 한국어로 자연스럽게 설명하세요.\n\n"
+        "각 구간에 대해 위에 적힌 것과 정확히 같은 start/end 시간(초 단위 숫자)을 그대로 사용해서 whatsWrong(무엇이 다른지), "
+        "why(그 동작에서 왜 그런 차이가 나는지), howToFix(구체적인 교정 방법)를 작성하고, overallComment에 전체 총평을 3문장 이내 한국어로 작성하세요."
+    )
+
+
+def build_descriptive_prompt(ref_title: str) -> str:
+    """팀원의 buildDescriptivePrompt 를 그대로 옮긴 것 — 유튜브 레퍼런스는 포즈 데이터가 없어
+    숫자를 계산할 수 없으므로, Gemini 에게 두 영상을 직접 보고 서술하게만 시킨다."""
+    return (
+        f"당신은 댄스 안무 코치입니다. 첫 번째 영상은 사용자가 춤춘 영상이고, 두 번째는 유튜브 레퍼런스 영상(\"{ref_title}\")입니다.\n\n"
+        "중요: 이 비교는 포즈 인식 데이터가 없어서 정확한 퍼센트나 관절 각도를 계산할 방법이 전혀 없습니다. "
+        "퍼센트, 점수, 각도 등 어떤 숫자도 절대 지어내지 마세요. 오직 두 영상을 직접 보고 관찰한 차이만 말로 서술하세요.\n\n"
+        "사용자 영상 타임라인 기준으로 눈에 띄게 다른 구간들을 찾아서, 각각 whatsWrong(무엇이 다른지), "
+        "why(왜 그런 차이가 나는 것 같은지), howToFix(교정 방법)를 한국어로 서술하고, overallComment에 전체 총평을 3문장 이내로 작성하세요."
+    )
+
+
+def resolve_version_video(project_id: str, version_id: str) -> Path:
+    row = store.connect().execute(
+        "SELECT video_url FROM versions WHERE id = ? AND project_id = ?",
+        (version_id, project_id)).fetchone()
+    if not row or not row["video_url"]:
+        raise HTTPException(404, "그 버전에는 영상이 없어요.")
+    path = UPLOADS_PATH / Path(row["video_url"]).name
+    if not path.exists():
+        raise HTTPException(404, "영상 파일을 찾을 수 없어요.")
+    return path
+
+
+@app.post("/v1/projects/{project_id}/advice")
+def advice(project_id: str, user_id: str = Body(...), target_version_id: str = Body(...),
+           compare: dict | None = Body(None),
+           ref_youtube_url: str | None = Body(None), ref_youtube_title: str | None = Body(None)) -> dict:
+    """이미 계산된 비교 결과(점수·관절 차이)를 근거로 Gemini 가 서술형 조언을 만든다.
+
+    기본 모드(ref_youtube_url 없음): 첫 번째 영상은 비교 대상 버전(사용자 영상), 두 번째는
+    프로젝트의 현재 HEAD(레퍼런스)다. 수치는 클라이언트가 이미 poseCompare.ts 로 계산해
+    보낸 것이며, 프롬프트는 그 수치를 그대로 설명하도록 지시한다.
+
+    유튜브 모드(ref_youtube_url 있음): 유튜브 레퍼런스는 포즈 데이터가 없으므로 점수·관절
+    수치 없이 Gemini 가 두 영상을 직접 보고 서술하게만 한다 — 팀원의 route.ts 두 모드와 동일.
+    """
+    require_user(user_id)
+    target_path = resolve_version_video(project_id, target_version_id)
+    client = genai_client()
+    try:
+        target_file = upload_and_wait_active(client, target_path)
+        if ref_youtube_url:
+            contents = [
+                build_descriptive_prompt(ref_youtube_title or "레퍼런스 영상"),
+                genai_types.Part.from_uri(file_uri=target_file.uri, mime_type=target_file.mime_type),
+                genai_types.Part.from_uri(file_uri=ref_youtube_url, mime_type="video/mp4"),
+            ]
+        else:
+            project = store.get_project(project_id)
+            if not project: raise HTTPException(404, "작업을 찾을 수 없습니다.")
+            if not project.get("videoUrl"): raise HTTPException(404, "이 작업에는 영상이 없어요.")
+            head_path = UPLOADS_PATH / Path(project["videoUrl"]).name
+            if not head_path.exists(): raise HTTPException(404, "영상 파일을 찾을 수 없어요.")
+            head_file = upload_and_wait_active(client, head_path)
+            segments = (compare or {}).get("segments") or []
+            contents = [
+                build_numeric_prompt(segments),
+                genai_types.Part.from_uri(file_uri=target_file.uri, mime_type=target_file.mime_type),
+                genai_types.Part.from_uri(file_uri=head_file.uri, mime_type=head_file.mime_type),
+            ]
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=ADVICE_JSON_SCHEMA,
+            ),
+        )
+        text = response.text
+        if not text: raise HTTPException(502, "Gemini 응답이 비어있어요.")
+        return json.loads(text)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(502, f"AI 조언 생성에 실패했어요: {error}")
+
+
+@app.get("/v1/youtube/search")
+def youtube_search(q: str) -> dict:
+    """유튜브 레퍼런스 검색 — 임베드·크리에이티브 커먼즈 라이선스 영상만 보여준다(팀원의
+    /api/youtube/search 필터와 동일). 포즈 비교는 하지 않는다 — 선택된 영상은 advice
+    엔드포인트에서 Gemini 에게 URL 그대로 넘겨 서술형 조언만 받는다.
+    """
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key: raise HTTPException(503, "서버에 YOUTUBE_API_KEY가 설정되지 않았어요.")
+    if not q.strip(): return {"items": []}
+    params = urllib.parse.urlencode({
+        "part": "snippet", "type": "video", "maxResults": 12,
+        "videoEmbeddable": "true", "videoLicense": "creativeCommon",
+        "q": q, "key": api_key,
+    })
+    try:
+        with urllib.request.urlopen(f"https://www.googleapis.com/youtube/v3/search?{params}", timeout=10) as response:
+            data = json.loads(response.read())
+    except Exception as error:
+        raise HTTPException(502, f"유튜브 검색에 실패했어요: {error}")
+    items = [{
+        "videoId": item["id"]["videoId"],
+        "title": item["snippet"]["title"],
+        "channelTitle": item["snippet"]["channelTitle"],
+        "thumbnailUrl": item["snippet"]["thumbnails"]["medium"]["url"],
+    } for item in data.get("items", []) if item.get("id", {}).get("videoId")]
+    return {"items": items}
 
 
 @app.get("/v1/projects/{project_id}/files")

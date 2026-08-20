@@ -821,6 +821,188 @@ ffmpeg concat 으로 구간을 이어 붙인 정본을 생성하는 것. 그러�
 지금은 타임라인이 70초여도 정본 영상은 원본 60초다. 확장된 뒤쪽 10초는 그 버전의 구간
 영상으로만 볼 수 있다.
 
+## 팀원 프로젝트 병합 — 비교(Compare) 기능 이식 (2026-08-20)
+
+멋사 팀원의 Next.js+Supabase 프로젝트(별도 저장소)와 병합하기로 하고, **기존 방식(FastAPI+
+SQLite)은 유지한 채 팀원 쪽 기능을 이 Expo 앱에 하나씩 이식**하는 방향으로 정했다. 첫 번째로
+가장 자기완결적이고 값어치가 큰 **포즈 비교 엔진**을 가져왔다.
+
+### 무엇을 가져왔나
+
+`lib/poseCompare.ts` — 팀원의 `src/lib/compare/pose-compare.ts` + `types.ts`를 **알고리즘은
+한 글자도 바꾸지 않고** 그대로 포팅했다. DTW(Dynamic Time Warping)로 두 포즈 시퀀스의
+프레임을 맞추고, 12개 관절 각도 차이로 채점한다. 좌우 반전(거울 모드)도 자동 감지.
+
+이 앱은 한 사람만 추적하는데(`MotionFrame`) 팀원 쪽은 다인 지원용으로 프레임마다
+`persons[]` 배열을 둔다. 그 경계만 `motionFramesToPoseFrames()` 어댑터로 잇고, 나머지
+로직은 완전히 동일하다 — 팀원 쪽에서 vitest 44개로 검증된 코드를 다시 짤 이유가 없었다.
+
+### 왜 정확한지 검증했나
+
+이 프로젝트엔 테스트 러너가 없어서(vitest 미설치), 스크래치패드에서 독립 컴파일 후
+합성 포즈로 수동 검증했다.
+
+| 시나리오 | 결과 |
+| --- | --- |
+| 동일 자세 시퀀스 | 100점 |
+| 왼쪽 팔꿈치를 크게 굽힌 시퀀스 | 95점, `왼쪽 어깨 63.4°` `왼쪽 팔꿈치 45°` 로 정확히 지목 |
+| 좌우 반전된 동작 | `mirrored: true` 자동 감지, 100점 근처 |
+
+실제 데이터로도 확인: 같은 프로젝트의 v1(180프레임 원본)과 v2(36프레임, 다른 영상)를
+비교해 **92% 일치**, `왼쪽 팔꿈치 49.5°` 등 실제 차이가 나왔다.
+
+### 화면
+
+죽어 있던(아무도 진입하지 않던) `analysis`/`motion` 라우트 슬롯을 재활용했다 — 새 슬롯을
+추가하지 않고 기존 그리드/네비게이션 구조를 그대로 썼다.
+
+- **버전 화면 그리드**에 「버전 비교」 타일 추가
+- **Analysis** → 「버전 비교」: 현재 버전(HEAD)을 기준으로, 영상이 붙은 다른 반영 버전 목록에서 고른다
+- **Motion** → 「비교 결과」: 일치율 · 반전 감지 · 관절 신뢰도 경고 · 가장 차이 나는 관절 3개
+
+서버 호출 없이 이미 있는 `/v1/projects/{id}/frames`, `/v1/projects/{id}/versions/{vid}/frames`
+엔드포인트로 받은 프레임 데이터를 **클라이언트에서** 계산한다 — 새 백엔드 작업이 필요 없었다.
+
+### 남은 것
+
+팀원 프로젝트의 6가지 기능(비교, AI 조언, 실시간 연습, 유튜브 비교, 대형 구성) 이식이
+모두 끝났다. Vercel 배포까지 완료 — 아래 참고.
+
+## Vercel 배포 (2026-08-20) — 팀원의 Next.js+Supabase 앱을 내 계정으로 독립 배포
+
+**배포한 대상은 Expo 앱이 아니라 팀원의 Next.js+Supabase 앱**(`~/Desktop/project--/choreohub`)이다
+— Vercel은 FastAPI+SQLite+mediapipe(무거운 서버 프로세스, 영구 파일시스템 필요)를 호스팅할 수
+없고, Next.js+Supabase는 원래 Vercel용으로 만들어졌기 때문. 이 Next.js 앱은 이미 위에서
+이식한 6개 기능을 전부 원본 그대로 갖고 있다(이식은 그 반대 방향 — 여기서 Expo 로 옮긴 것).
+
+- **새 Supabase 프로젝트**: `choreohub` (ref `toyuwvnadxjzchgyoyah`), 사용자 개인 org
+  "crumblycake" 아래, ap-northeast-2(서울) 리전. 팀 공유 프로젝트와 완전히 분리된 별도
+  DB — 팀원 데이터와 안 섞인다. 마이그레이션 0001~0013 전부 `supabase db push`로 적용,
+  Anonymous 로그인도 Management API로 활성화(`external_anonymous_users_enabled: true`).
+  익명 로그인 → profiles 트리거 정상 동작까지 실제로 검증함.
+  - DB 비밀번호는 `openssl rand`로 생성해 `.env.local`의 `SUPABASE_DB_PASSWORD`에 저장.
+  - Pooler 연결 문자열 형식(직접 연결 `db.<ref>.supabase.co`는 이 네트워크에서 DNS가 안
+    풀림 — IPv6 전용이라 흔한 문제): `postgresql://postgres.<ref>:<pw>@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres`
+- **새 Vercel 프로젝트**: `aloh/choreohub` (사용자 자신의 팀 "aloh", 팀원의 "choreohub1"과
+  무관). `vercel link`로 새로 생성, 런타임에 필요한 6개 환경변수(GEMINI_API_KEY,
+  YOUTUBE_API_KEY, NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
+  NEXT_PUBLIC_TOSS_CLIENT_KEY, TOSS_SECRET_KEY)를 `vercel env add --value`로 등록 후
+  `vercel deploy --prod`.
+- **배포 주소**: https://choreohub-virid.vercel.app — 홈/로그인 페이지 200 확인.
+- **CLI 인증**: Supabase는 이 환경에 TTY가 없어 `supabase login`(브라우저 OAuth)이 실패함
+  → 사용자가 대시보드(supabase.com/dashboard/account/tokens)에서 개인 액세스 토큰을 직접
+  발급해서 전달, `SUPABASE_ACCESS_TOKEN` 환경변수로 사용. Vercel CLI는 이미
+  `chisung42`로 로그인돼 있어서 별도 인증 불필요했음.
+- `.env.local`은 기존 팀 공유 프로젝트 값을 가리키던 것을 새 프로젝트 값으로 덮어썼다
+  (백업은 이 세션의 scratchpad에만 있음, 리포에는 없음) — 로컬 개발도 이제 새 프로젝트를
+  본다. `supabase link`가 이 디렉터리에 `supabase/config.toml`을 새로 만들었는데, 이전엔
+  링크 상태가 전혀 없었던 디렉터리였다(0013 마이그레이션도 raw pg 스크립트로 적용했었음) —
+  팀원이 나중에 이 디렉터리에서 `supabase db push`를 실행하면 내 새 프로젝트를 향하게
+  되니 주의가 필요하다.
+
+## 유튜브 레퍼런스 비교 이식 (2026-08-20)
+
+`GET /v1/youtube/search`(YouTube Data API 프록시, `YOUTUBE_API_KEY` 필요) 추가.
+`/v1/projects/{id}/advice`에 `ref_youtube_url`/`ref_youtube_title` 분기 추가 — 유튜브
+레퍼런스엔 포즈 데이터가 없으므로 DTW 점수 없이 `build_descriptive_prompt`로 Gemini에게
+서술만 시킨다(팀원의 `mode==="descriptive"`와 동일). **확인된 사실**: Gemini
+`generateContent`는 `youtube.com/watch?v=...` URL을 `Part.from_uri`로 그대로 넘기면
+서버가 직접 그 영상을 시청해서 응답한다 — 다운로드도, 클라이언트 쪽 프레임 추출도 필요
+없다(Python SDK에서는 `mime_type`을 명시해줘야 함, 안 그러면 `mimetypes.guess_type`이
+실패해서 에러남). Version 화면에 "유튜브 비교" 타일 추가 → 내 영상 선택 + 유튜브 검색·선택
+→ AI 조언(총평 + 구간별 서술, 숫자 없음). 실제 키로 검색·Gemini 호출 모두 curl 로 검증함.
+
+## 대형(formation) 구성 이식 (2026-08-20)
+
+팀원의 `lib/formation/{types,formationUtils,store}.ts`를 `lib/formation.ts`로 이식.
+**팀원 쪽도 Supabase에 저장하지 않는 순수 클라이언트 상태였다**(새로고침하면 사라짐) —
+그래서 이 포팅도 서버 작업이 전혀 필요 없었다. 3D(react-three-fiber) 무대는 장식일
+뿐이고 실제 편집 모델은 댄서마다 x/z(바닥 좌표)뿐이라, 3D 뷰는 옮기지 않고 RN
+`View`+`PanResponder`로 만든 2D 무대(280px = 8m×8m)만 옮겼다. Version 화면에
+"대형 구성" 타일 추가. 구간(section)별로 댄서를 무대에서 드래그하거나 격자 배치, 무대를
+탭해서 추가. 세션 동안만 프로젝트별로 기억하고 새로고침하면 사라진다 — 팀원 기능과
+동일한 동작. 팀원의 "포즈로 초기화"(ankle landmark → 초기 대형) 기능과 구간 타이밍
+드래그-리사이즈는 스코프에서 뺐다(핵심 가치와 무관한 폴리시).
+
+**추가(2026-08-21) — 3D 무대**: 사용자가 "팀원 것처럼 3D로" 요청해서 실제 3D 뷰도 추가함.
+`components/FormationStage3D.web.tsx`(three.js + @react-three/fiber + @react-three/drei,
+팀원의 StageView.tsx/DancerFigure.tsx 그대로 이식 — 캡슐+구체 몸통, 링 바닥 표시,
+OrbitControls 자유 회전) + `components/FormationStage3D.tsx`(네이티브용 대체 — "웹에서만
+지원" 안내문). **파일 확장자로 플랫폼을 나눴다**(`.web.tsx` vs 기본 `.tsx`) — Metro가
+플랫폼별로 완전히 다른 파일을 골라서, `@react-three/fiber`의 `react-native` 필드가
+expo-gl(설치 안 함)을 요구하는 네이티브 전용 진입점으로 가리키는 문제를 원천적으로
+피했다. 실제로 iOS 번들에 `capsuleGeometry`/three.js 관련 코드가 전혀 없고 대체
+컴포넌트만 들어간 것을 번들 덤프로 직접 확인함. Formation 화면에 "3D 무대"/"2D
+무대(드래그 편집)" 토글 추가, 기본값은 3D. 3D 뷰는 회전+선택(클릭 시 강조)만 하고,
+위치 이동은 여전히 2D 무대(드래그) 또는 아래 댄서 목록에서 — 팀원 원본도 3D에서는
+드래그 이동을 안 만들고 선택+이름수정/삭제만 지원했다.
+
+## 원본+구간 합쳐보기 (2026-08-21)
+
+`GET /v1/projects/{id}/versions/{version_id}/merged` 추가 — 이 버전의 구간 영상을 지금
+작업의 원본(HEAD) 영상 안에 그 구간(start_ms~end_ms)만큼 실제로 이어붙여서 하나의 mp4로
+만든다. "구간 영상 보기"(그 구간만 따로 보기)와는 다르다 — 이건 이 수정이 전체 안무
+흐름 안에서 어떻게 보이는지 미리 보는 것.
+
+- ffmpeg `filter_complex`로 [원본 0~시작] + [구간 영상 전체] + [원본 끝~끝] 세 조각을
+  scale+pad+fps 로 서로 맞춘 뒤 concat — 세 조각의 해상도/fps 가 달라도(폰 vs 웹캠) 깨지지
+  않는다. 오디오는 다루지 않음(v=1:a=0) — 연습 녹화가 원래 무음(`getUserMedia({audio:false})`)
+  이라 애초에 신경 쓸 오디오가 없다.
+- `(base_hash).merged.(version_id).mp4` 로 캐시 — 같은 버전 다시 요청하면 ffmpeg 다시 안 돌림.
+  versions/projects 테이블은 안 건드리는 순수 파생 산출물.
+- 검증: 실제 두 영상(84763a7c 6초 30fps, da795ce1 3초 12fps)으로 두 시나리오 확인 —
+  ①길이 같은 구간 교체(3초→3초): 결과 정확히 6초. ②길이 다른 구간 교체(1초→3초): 결과
+  정확히 8초(1+3+4). 둘 다 ffprobe 로 실제 프레임수·해상도까지 확인함.
+- Version 화면의 각 버전 행에 "합쳐진 영상 보기" 버튼 추가(구간이 지정된 버전에만 노출,
+  "전체" 버전은 이미 그 자체가 기준영상이라 합칠 게 없음) — 결과 URL을 새 탭/플레이어로 연다.
+
+## Gemini AI 서술형 조언 이식 (2026-08-20)
+
+`mediapipe-service/main.py`에 `POST /v1/projects/{id}/advice` 추가. 두 버전의 영상을 Gemini
+Files API에 업로드 → ACTIVE 대기 → 팀원의 `route.ts`와 동일한 수치 기반 프롬프트
+(`build_numeric_prompt`)로 `gemini-3.6-flash` 호출 → `{segments, overallComment}` 반환.
+Pro 결제 게이트는 이 앱에 결제 시스템이 없어 생략. `google-genai` 파이썬 SDK 필요
+(`requirements.txt`에 추가됨), `GEMINI_API_KEY` 환경변수 필요. "비교 결과" 화면에
+"영상 보고 조언 받기" 버튼으로 연결.
+
+## 웹캠 실시간 연습 이식 (2026-08-20)
+
+팀원의 `LivePracticeSession.tsx` + `mediapipe.ts` + `poseExtraction.ts` +
+`interpolatePose.ts` + `livePhrases.ts`를 `lib/livePractice.ts` 하나로 합쳐 이식.
+Version 화면 액션 그리드에 "실시간 연습" 타일(`live` 라우트) 추가.
+
+- **웹 전용** — `getUserMedia`/`MediaRecorder`/`requestVideoFrameCallback`/브라우저
+  MediaPipe는 네이티브에 없다. `isLiveSupported()`가 `Platform.OS!=='web'`이면 안내
+  문구만 보여주고 기능을 막는다.
+- **Metro 함정**: `@mediapipe/tasks-vision`을 `import()`/`require()`로 직접 쓰면 Metro가
+  패키지 내부의 동적 `import(t.toString())`(Emscripten이 생성한 wasm 로더)을 정적으로
+  분석하다가 빌드가 깨진다(Webpack/Vite는 되지만 Metro는 리터럴이 아닌 동적 import를
+  거부함). 해결: npm 패키지는 타입 전용(`import type`)으로만 쓰고, 런타임에는
+  `<script src="https://cdn.jsdelivr.net/.../vision_bundle.js">`를 직접 주입해
+  `window.Vision` 전역으로 꺼내 쓴다(구글 공식 `<script>` 사용법과 동일). 이렇게 하면
+  Metro 의존성 그래프에 그 패키지가 전혀 들어오지 않는다.
+- **레퍼런스 영상 재생 시계가 곧 마스터 클록**: `driveFrameGrid`가 레퍼런스 `<video>`의
+  `requestVideoFrameCallback`을 10fps 그리드로 구동하고, 그 틱마다 웹캠 프레임에 포즈를
+  돌려 `compareLiveFrame`(이미 `lib/poseCompare.ts`에 있던 것, 새 코드 없음)으로 즉석
+  채점한다.
+- **녹화본 저장 방식은 팀원과 다르게 갔다**: 팀원은 브라우저에서 뽑은 라이브 포즈
+  프레임을 그대로 DB에 영구 저장했지만, 여기서는 그 프레임을 실시간 UX(점수·문구)에만
+  쓰고 버린다. 세션이 끝나면 녹화된 웹캠 클립(webm)을 기존 업로드·분석 파이프라인
+  (`uploadForAnalysis` → `/v1/jobs` → 서버 MediaPipe heavy 모델)에 그대로 태워 분석한다 —
+  "서버가 기록의 단일 진실 공급원" 원칙을 지키기 위한 의도적 단순화.
+- **(2026-08-21 수정) 처음엔 이 결과를 `versions` 에 새 버전으로 넣었는데, 사용자가
+  "안무 수정 업로드와 연습은 분리해달라"고 해서 완전히 분리했다.** 연습은 안무를 실제로
+  고친 게 아닌데 versions 테이블에 들어가면 협업자에게 "누가 안무를 바꿨다"는 잘못된
+  인상을 준다(버전 번호가 매겨지고 HEAD/크레딧 로직에도 얽힌다). 새 `practice_runs`
+  테이블(store.py)을 만들어 완전히 분리 — `POST/GET /v1/projects/{id}/practice`.
+  버전 이력·HEAD·크레딧에 전혀 영향 없음을 실제 호출로 확인(연습 기록 생성 후
+  `/versions`의 main 배열 길이가 그대로임을 확인). 안무 수정(제안하기/즉시반영)은
+  여전히 `make_version`/`/v1/projects/{id}/versions` 쪽 몫 그대로.
+- 검증: `tsc --noEmit` 통과, Metro 웹/iOS 번들 둘 다 200 (이전에
+  `@mediapipe/tasks-vision` 정적 import 때문에 웹 번들이 500으로 깨졌던 걸 위 방식으로
+  고침). 카메라 권한이 필요한 실제 웹캠 클릭 스루는 이 세션에 브라우저 자동화 도구가
+  없어서 사용자가 직접 브라우저에서 확인 필요.
+
 ## 현재 버전(HEAD) 지정 (2026-08-20)
 
 여러 버전이 쌓였을 때 어느 것을 현재 상태로 볼지 고를 수 있다. **이력은 지우지 않고

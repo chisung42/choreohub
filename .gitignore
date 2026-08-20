@@ -51,5 +51,8 @@ mediapipe-service/choreohub.db-wal
 # 세션 중 만든 편집 백업본
 .backup/
 
+# Supabase CLI 가 잘못된 디렉터리에서 실행돼 남긴 로컬 캐시 — 이 프로젝트와 무관
+supabase/.temp/
+
 # 로컬 환경 변수 (비밀은 없지만 관례상 제외, .env.example 참고)
 .env

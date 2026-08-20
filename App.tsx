@@ -1,12 +1,25 @@
 import { StatusBar } from 'expo-status-bar';
+import { compareLiveFrame, compareSequences, motionFramesToPoseFrames, type PoseCompareScore, type PoseFrame } from './lib/poseCompare';
+import {
+  driveFrameGrid, getPoseLandmarker, interpolatePoseAt, phraseForJoint, praisePhrase,
+  reserveTimestampSession, toGraphTimestampMs, toPosePersonFrames, SAMPLE_FPS,
+  type RVFCVideo, type WorstJoint,
+} from './lib/livePractice';
+import { makeEmptyDancer, makeGridFormation, type FormationDancer, type FormationSection } from './lib/formation';
+import FormationStage3D from './components/FormationStage3D';
 import { useEffect, useRef, useState } from 'react';
-import { LayoutChangeEvent, Linking, Modal, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { LayoutChangeEvent, Linking, Modal, PanResponder, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import Svg, { Circle, Line } from 'react-native-svg';
 
-type Page = 'home' | 'library' | 'new' | 'capture' | 'version' | 'overlay' | 'data' | 'analysis' | 'motion' | 'collab' | 'perform' | 'profile' | 'community' | 'license' | 'passport';
+type Page = 'home' | 'library' | 'new' | 'capture' | 'version' | 'overlay' | 'data' | 'analysis' | 'motion' | 'collab' | 'perform' | 'profile' | 'community' | 'license' | 'passport' | 'live' | 'youtube' | 'formation' | 'practiceLog';
+type PracticeRun = {
+  id: string; projectId: string; userId: string; userName: string | null; referenceVersionId: string | null;
+  sourceSha256: string | null; videoUrl: string | null; videoWidth: number | null; videoHeight: number | null;
+  frameCount: number | null; overallScore: number | null; mirrored: boolean; createdAt: string;
+};
 type License = '연습 전용' | '비상업 커버 허용' | '리믹스 허용' | '상업 이용 협의';
 type MotionAsset = { uri: string; fileName: string; mimeType: string; duration?: number | null; source: 'camera' | 'library'; webFile?: File };
 type Landmark = { x: number; y: number; z: number; visibility: number };
@@ -52,6 +65,10 @@ type Profile = {
   contributions: { weeks: ContributionDay[][]; months: { label: string; week: number }[]; total: number };
   projects: { id: string; name: string; color: string; license: License; version: string; isOwner: boolean }[];
   activity: { kind: string; text: string; date: string }[];
+};
+type AdviceResult = {
+  segments: { start: number; end: number; whatsWrong: string; why: string; howToFix: string }[];
+  overallComment: string;
 };
 type StageMode = 'original' | 'overlay' | 'skeleton';
 type JobStage = 'uploading' | 'analyzing' | 'rendering' | 'encoding' | 'done' | 'error';
@@ -105,6 +122,68 @@ const saveMe = (me: Me | null) => {
 // 기여자마다 색을 하나씩 준다. 첫 등장 순서로 배정해 화면을 다시 열어도 같은 색이 나온다.
 const CREDIT_COLORS = ['#7FA5FF', '#4FC7A2', '#FF8B77', '#E0AE3C', '#B490E8', '#4BC3D9', '#F084B8'];
 
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+// 대형 무대는 세로(깊이) 8m 기준 280px 를 그대로 두고, 가로(폭)만 2.5배 넓혀 20m 를 담는다 —
+// 픽셀당 미터 비율(FORMATION_SCALE)은 가로세로 똑같이 유지해서 댄서가 옆으로 늘어나 보이지
+// 않는다. 무대 자체가 옆으로 넓어지는 것이지, 기존 정사각형을 잡아 늘인 게 아니다.
+const FORMATION_STAGE_HEIGHT_PX = 280;
+const FORMATION_STAGE_WIDTH_PX = Math.round(FORMATION_STAGE_HEIGHT_PX * 2.5);
+const FORMATION_SCALE = FORMATION_STAGE_HEIGHT_PX / 8;
+const FORMATION_HALF_WIDTH_M = FORMATION_STAGE_WIDTH_PX / 2 / FORMATION_SCALE;
+const FORMATION_HALF_DEPTH_M = FORMATION_STAGE_HEIGHT_PX / 2 / FORMATION_SCALE;
+const meterToPxX = (m: number) => FORMATION_STAGE_WIDTH_PX / 2 + m * FORMATION_SCALE;
+const meterToPxZ = (m: number) => FORMATION_STAGE_HEIGHT_PX / 2 + m * FORMATION_SCALE;
+/**
+ * 모듈 스코프에 둬야 한다 — App() 안에서 정의하면 App이 리렌더될 때마다 새 함수 참조가
+ * 되어 React가 매번 다른 컴포넌트로 인식해 마운트를 해제·재생성한다. 그러면 드래그 한 틱
+ * 마다(onPanResponderMove → moveFormationDancer → 리렌더) PanResponder 를 담은 useRef가
+ * 초기화되어 응답자(responder) 상태를 잃어버려 드래그가 첫 틱 이후 멈춘 것처럼 보인다.
+ */
+/**
+ * 드래그 중 화면 위치만 즉시 바꾸는 헬퍼 — react-native-web 의 View 는 `setNativeProps` 가
+ * 없고 ref 가 그냥 DOM 노드라서(usePlatformMethods 에 measure* 만 얹혀 있음) 그럴 때는
+ * DOM style 을 직접 건드린다. 진짜 네이티브(iOS/Android) 에서는 RN 의 setNativeProps 를 쓴다.
+ */
+function setDancerTokenPosition(node: any, left: number, top: number) {
+  if (!node) return;
+  if (typeof node.setNativeProps === 'function') node.setNativeProps({ style: { left, top } });
+  else if (node.style) { node.style.left = `${left}px`; node.style.top = `${top}px`; }
+}
+
+const DancerToken = ({ dancer, sectionId, onMove }: { dancer: FormationDancer; sectionId: string; onMove: (sectionId: string, dancerId: string, x: number, z: number) => void }) => {
+  const dancerRef = useRef(dancer); dancerRef.current = dancer;
+  const startRef = useRef({ x: dancer.x, z: dancer.z });
+  const viewRef = useRef<View>(null);
+  // 드래그 중에는 React 상태를 안 건드린다 — 매 픽셀 이동마다 setState 하면 이 앱 전체(거대한
+  // 단일 컴포넌트)가 매번 다시 렌더링돼서 눈에 띄게 끊긴다. 대신 setNativeProps 로 화면
+  // 위치만 직접 바꾸고, 손을 뗄 때 한 번만 실제 상태에 반영한다.
+  const computeXZ = (gesture: { dx: number; dy: number }) => ({
+    x: clamp(startRef.current.x + gesture.dx / FORMATION_SCALE, -(FORMATION_HALF_WIDTH_M - 0.1), FORMATION_HALF_WIDTH_M - 0.1),
+    z: clamp(startRef.current.z + gesture.dy / FORMATION_SCALE, -(FORMATION_HALF_DEPTH_M - 0.1), FORMATION_HALF_DEPTH_M - 0.1),
+  });
+  const panResponder = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderGrant: () => { startRef.current = { x: dancerRef.current.x, z: dancerRef.current.z }; },
+    onPanResponderMove: (_evt, gesture) => {
+      const { x, z } = computeXZ(gesture);
+      setDancerTokenPosition(viewRef.current, meterToPxX(x) - 16, meterToPxZ(z) - 16);
+    },
+    onPanResponderRelease: (_evt, gesture) => {
+      const { x, z } = computeXZ(gesture);
+      onMove(sectionId, dancerRef.current.id, x, z);
+    },
+    onPanResponderTerminate: (_evt, gesture) => {
+      const { x, z } = computeXZ(gesture);
+      onMove(sectionId, dancerRef.current.id, x, z);
+    },
+  })).current;
+  return <View ref={viewRef} style={[s.formationDancer, { left: meterToPxX(dancer.x) - 16, top: meterToPxZ(dancer.z) - 16 }]} {...panResponder.panHandlers}>
+    <Text style={s.formationDancerLabel}>{dancer.label}</Text>
+  </View>;
+};
+
 /** 밀리초 → `0:08`. 구간은 사람이 읽는 분:초가 기본 표기다. */
 const fmtMs = (ms: number) => {
   const total = Math.max(0, Math.round(ms / 1000));
@@ -126,6 +205,13 @@ const parseClock = (text: string): number | null => {
 /** 잡 시작 응답에서 영상 길이(ms)를 구한다. 작품 타임라인의 기준이 된다. */
 const durationOf = (started: { frame_count?: number; fps?: number }) =>
   started.frame_count && started.fps ? Math.round((started.frame_count / started.fps) * 1000) : null;
+
+/** 시작 시각 + 첨부한 영상 길이 = 끝 시각. 영상이 없거나 시작이 아직 안 적혀 있으면 null. */
+const autoEndFromClip = (fromText: string, durationMs: number | null | undefined): string | null => {
+  const fromMs = parseClock(fromText);
+  if (fromMs === null || !durationMs) return null;
+  return fmtMs(fromMs + durationMs);
+};
 
 /** 길이를 사람 말로. 지분 표기가 타임스탬프처럼 읽히지 않게 한다. */
 const fmtSpan = (seconds: number) => seconds >= 60
@@ -314,10 +400,363 @@ export default function App() {
   const [fileList, setFileList] = useState<FileList | null>(null);
   const [fileView, setFileView] = useState<FileView | null>(null);
   const [versions, setVersions] = useState<VersionGraph | null>(null);
+  // 연습 기록 — versions 와 분리된 practice_runs 를 따로 불러온다(안무 수정 이력과 안 섞임).
+  const [practiceRuns, setPracticeRuns] = useState<PracticeRun[] | 'loading' | 'error' | null>(null);
   const [proposeOpen, setProposeOpen] = useState(false);
   // 특정 버전의 클립만 볼 때 — null 이면 작품의 현재 영상을 본다
   const [viewingVersion, setViewingVersion] = useState<VersionEntry | null>(null);
   const [versionFrames, setVersionFrames] = useState<{ key: string; frames: MotionFrame[] }>({ key: '', frames: [] });
+  // 버전 비교 — HEAD 대 다른 반영된 버전의 관절 시퀀스를 DTW 로 맞춰 채점한다(팀원 프로젝트의
+  // pose-compare.ts 를 그대로 가져온 lib/poseCompare.ts 사용). 서버 호출 없이 이미 받아 둔
+  // 프레임 데이터로 클라이언트에서 계산한다.
+  const [compareTarget, setCompareTarget] = useState<VersionEntry | null>(null);
+  const [compareResult, setCompareResult] = useState<PoseCompareScore | 'loading' | 'error' | null>(null);
+  // AI 서술형 조언 — DTW 로 이미 계산된 점수·관절 차이를 서버(mediapipe-service)로 보내면
+  // Gemini 가 두 영상을 직접 보고 그 수치를 근거로 설명해 준다(팀원의 compare/advice 라우트를
+  // FastAPI 로 이식한 것). 숫자는 새로 만들지 않고 이미 계산된 것만 설명하도록 프롬프트에 못박아 둔다.
+  const [adviceResult, setAdviceResult] = useState<AdviceResult | 'loading' | 'error' | null>(null);
+
+  const runCompare = async (target: VersionEntry) => {
+    if (!selected) return;
+    setCompareTarget(target);
+    setCompareResult('loading');
+    setAdviceResult(null);
+    try {
+      const [headData, targetData] = await Promise.all([
+        api(`/v1/projects/${selected.id}/frames`),
+        api(`/v1/projects/${selected.id}/versions/${target.id}/frames`),
+      ]);
+      const headFrames: MotionFrame[] = headData?.frames ?? [];
+      const targetFrames: MotionFrame[] = targetData?.frames ?? [];
+      if (!headFrames.length || !targetFrames.length) { setCompareResult('error'); return; }
+      const result = compareSequences(
+        motionFramesToPoseFrames(headFrames),
+        motionFramesToPoseFrames(targetFrames),
+      );
+      setCompareResult(result);
+    } catch { setCompareResult('error'); }
+  };
+
+  const requestAdvice = async () => {
+    if (!selected || !compareTarget || !me) return;
+    const r = compareResult;
+    if (!r || r === 'loading' || r === 'error') return;
+    setAdviceResult('loading');
+    try {
+      const result: AdviceResult = await api(`/v1/projects/${selected.id}/advice`, {
+        method: 'POST',
+        body: {
+          user_id: me.user_id,
+          target_version_id: compareTarget.id,
+          compare: { overallScore: r.overallScore, mirrored: r.mirrored, segments: r.segments },
+        },
+      });
+      setAdviceResult(result);
+    } catch { setAdviceResult('error'); }
+  };
+
+  // 웹캠 실시간 연습 — 레퍼런스 영상의 재생 시계에 맞춰 웹캠 프레임을 그리드로 샘플링하고
+  // compareLiveFrame 으로 즉석 채점한다(팀원의 LivePracticeSession.tsx 이식, lib/livePractice.ts
+  // 참고). 녹화된 클립은 기존 업로드·분석 파이프라인(uploadForAnalysis)에 그대로 태워
+  // 서버가 다시 관절을 뽑게 한다 — 서버가 기록의 단일 진실 공급원이라는 원칙을 그대로 지킨다.
+  type LiveStatus = 'idle' | 'requesting-camera' | 'loading-model' | 'ready' | 'running' | 'finishing' | 'done' | 'unsupported' | 'error';
+  const [liveStatus, setLiveStatus] = useState<LiveStatus>('idle');
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [liveMirrored, setLiveMirrored] = useState(true);
+  const [liveScore, setLiveScore] = useState(0);
+  const [livePhrase, setLivePhrase] = useState('');
+  const [liveProgress, setLiveProgress] = useState(0);
+  const [liveJob, setLiveJob] = useState<JobProgress | null>(null);
+  const camWrapRef = useRef<View>(null);
+  const refWrapRef = useRef<View>(null);
+  const camVideoElRef = useRef<HTMLVideoElement | null>(null);
+  const refVideoElRef = useRef<HTMLVideoElement | null>(null);
+  const liveStreamRef = useRef<MediaStream | null>(null);
+  const liveRecorderRef = useRef<MediaRecorder | null>(null);
+  const liveChunksRef = useRef<Blob[]>([]);
+  const liveScoreWindowRef = useRef<number[]>([]);
+  const liveGridRef = useRef<{ stop: () => void } | null>(null);
+  const liveLandmarkerRef = useRef<Awaited<ReturnType<typeof getPoseLandmarker>> | null>(null);
+  const liveReferencePoseRef = useRef<PoseFrame[]>([]);
+  const liveSessionOffsetRef = useRef(0);
+  const liveMirroredRef = useRef(true);
+  const liveLastPhraseAtRef = useRef(0);
+  const liveFinishedRef = useRef(false);
+  liveMirroredRef.current = liveMirrored;
+
+  const isLiveSupported = () => Platform.OS === 'web' && typeof window !== 'undefined'
+    && typeof HTMLVideoElement !== 'undefined' && 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+  const stopLiveCameraTracks = () => {
+    liveGridRef.current?.stop(); liveGridRef.current = null;
+    liveStreamRef.current?.getTracks().forEach(track => track.stop());
+    liveStreamRef.current = null;
+  };
+
+  const startLiveCamera = async () => {
+    if (!selected) return;
+    setLiveError(null);
+    setLiveStatus('requesting-camera');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      liveStreamRef.current = stream;
+      const camEl = document.createElement('video');
+      camEl.muted = true; camEl.playsInline = true;
+      Object.assign(camEl.style, { width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' });
+      camEl.srcObject = stream;
+      const camContainer = camWrapRef.current as unknown as HTMLElement | null;
+      if (camContainer) { camContainer.innerHTML = ''; camContainer.appendChild(camEl); }
+      await camEl.play();
+      camVideoElRef.current = camEl;
+
+      const refEl = document.createElement('video');
+      refEl.playsInline = true;
+      Object.assign(refEl.style, { width: '100%', height: '100%', objectFit: 'contain' });
+      refEl.src = mediaUriOf(selected) ?? '';
+      const refContainer = refWrapRef.current as unknown as HTMLElement | null;
+      if (refContainer) { refContainer.innerHTML = ''; refContainer.appendChild(refEl); }
+      refVideoElRef.current = refEl;
+
+      setLiveStatus('loading-model');
+      const headData = await api(`/v1/projects/${selected.id}/frames`);
+      liveReferencePoseRef.current = motionFramesToPoseFrames(headData?.frames ?? []);
+      await getPoseLandmarker();
+      setLiveStatus('ready');
+    } catch (err: any) {
+      setLiveStatus('error');
+      setLiveError(err?.message ? `카메라를 켜지 못했어요: ${err.message}` : '카메라를 켜지 못했어요.');
+    }
+  };
+
+  const pushLiveScore = (score: number) => {
+    const win = liveScoreWindowRef.current;
+    win.push(score); if (win.length > 10) win.shift();
+    const avg = win.reduce((a, b) => a + b, 0) / win.length;
+    setLiveScore(Math.round(avg * 10) / 10);
+  };
+
+  const updateLivePhrase = (worstJoint: WorstJoint | null, avgScore: number) => {
+    const now = performance.now();
+    if (now - liveLastPhraseAtRef.current < 1200) return;
+    liveLastPhraseAtRef.current = now;
+    setLivePhrase(avgScore >= 90 || !worstJoint ? praisePhrase(now) : phraseForJoint(worstJoint.joint));
+  };
+
+  const onLiveTick = (t: number) => {
+    const landmarker = liveLandmarkerRef.current;
+    const cam = camVideoElRef.current;
+    if (!landmarker || !cam) return;
+    const result = landmarker.detectForVideo(cam, toGraphTimestampMs(liveSessionOffsetRef.current, t));
+    const persons = toPosePersonFrames(result.landmarks);
+    const userLandmarks = persons[0]?.landmarks ?? null;
+    const refLandmarks = interpolatePoseAt(liveReferencePoseRef.current, t)[0]?.landmarks ?? null;
+    const evalResult = compareLiveFrame(userLandmarks, refLandmarks, liveMirroredRef.current);
+    if (evalResult) { pushLiveScore(evalResult.score); updateLivePhrase(evalResult.worstJoint, evalResult.score); }
+    const duration = refVideoElRef.current?.duration || 0;
+    if (duration > 0) setLiveProgress(Math.min(100, (t / duration) * 100));
+  };
+
+  const startLiveSession = async () => {
+    const refEl = refVideoElRef.current, cam = camVideoElRef.current;
+    if (!refEl || !cam || !liveStreamRef.current) return;
+    setLiveError(null);
+    liveScoreWindowRef.current = []; liveFinishedRef.current = false;
+    setLiveScore(0); setLiveProgress(0); setLivePhrase('');
+    try {
+      liveLandmarkerRef.current = await getPoseLandmarker();
+      const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+        .find(t => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t));
+      const recorder = new MediaRecorder(liveStreamRef.current, mimeType ? { mimeType } : undefined);
+      liveChunksRef.current = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) liveChunksRef.current.push(e.data); };
+      liveRecorderRef.current = recorder;
+      recorder.start();
+
+      liveSessionOffsetRef.current = reserveTimestampSession(refEl.duration || 0);
+      refEl.currentTime = 0;
+      await refEl.play();
+      setLiveStatus('running');
+      liveGridRef.current = driveFrameGrid(refEl as RVFCVideo, 1 / SAMPLE_FPS, onLiveTick);
+      refEl.addEventListener('ended', () => finishLiveSession(), { once: true });
+    } catch (err: any) {
+      setLiveStatus('error');
+      setLiveError(err?.message ?? '세션을 시작하지 못했어요.');
+    }
+  };
+
+  const finishLiveSession = async () => {
+    if (liveFinishedRef.current || !selected || !me) return;
+    liveFinishedRef.current = true;
+    setLiveStatus('finishing');
+    liveGridRef.current?.stop(); liveGridRef.current = null;
+    refVideoElRef.current?.pause();
+
+    const recorder = liveRecorderRef.current;
+    const blob: Blob | null = await new Promise(resolve => {
+      if (!recorder || recorder.state === 'inactive') {
+        resolve(liveChunksRef.current.length ? new Blob(liveChunksRef.current) : null);
+        return;
+      }
+      recorder.onstop = () => resolve(new Blob(liveChunksRef.current, { type: recorder.mimeType }));
+      recorder.stop();
+    });
+    liveStreamRef.current?.getTracks().forEach(t => t.stop());
+    liveStreamRef.current = null;
+
+    if (!blob) {
+      setLiveStatus('error'); setLiveError('녹화된 내용이 없어요. 다시 시도해주세요.');
+      return;
+    }
+
+    const file = new File([blob], 'live-practice.webm', { type: blob.type || 'video/webm' });
+    const asset: MotionAsset = { uri: URL.createObjectURL(blob), fileName: 'live-practice.webm', mimeType: blob.type || 'video/webm', source: 'camera', webFile: file };
+
+    try {
+      const motion = await new Promise<Record<string, any>>((resolve, reject) => {
+        uploadForAnalysis(
+          asset,
+          job => { setLiveJob(job); if (job.stage === 'error') reject(new Error(job.error || '분석에 실패했어요.')); },
+          () => {},
+          result => resolve(result),
+        );
+      });
+      // 연습은 versions 와 완전히 분리된 기록이다 — 안무를 고친 게 아니라 개인 연습일 뿐이라
+      // 버전 이력·HEAD·크레딧에는 손대지 않는다(안무 수정은 여전히 제안하기/즉시반영 쪽 몫).
+      const avgScore = liveScoreWindowRef.current.length
+        ? liveScoreWindowRef.current.reduce((a, b) => a + b, 0) / liveScoreWindowRef.current.length
+        : liveScore;
+      await api(`/v1/projects/${selected.id}/practice`, { method: 'POST', body: {
+        user_id: me.user_id, reference_version_id: versions?.headId ?? null,
+        overall_score: Math.round(avgScore * 10) / 10, mirrored: liveMirroredRef.current, motion,
+      } });
+      setLiveStatus('done');
+      notify('연습 기록을 저장했어요', `일치율 ${Math.round(avgScore)}% · 안무 자체는 바뀌지 않아요`, 'ok');
+    } catch (err: any) {
+      setLiveStatus('error');
+      setLiveError(err?.message ?? '연습 기록 저장에 실패했어요.');
+    }
+  };
+
+  const stopLiveEarly = () => { refVideoElRef.current?.pause(); finishLiveSession(); };
+
+  const resetLive = () => {
+    stopLiveCameraTracks();
+    camVideoElRef.current = null; refVideoElRef.current = null;
+    setLiveStatus('idle'); setLiveError(null); setLiveScore(0); setLivePhrase(''); setLiveProgress(0); setLiveJob(null);
+  };
+
+  useEffect(() => {
+    if (page !== 'live') stopLiveCameraTracks();
+  }, [page]);
+
+  // 유튜브 레퍼런스 비교 — 유튜브 영상엔 포즈 데이터가 없어 DTW 채점은 못 한다. 대신 내
+  // 영상과 유튜브 URL을 그대로 Gemini 에 넘겨 서술형으로만 비교한다(팀원의 서술 모드와 동일,
+  // /v1/projects/{id}/advice 의 ref_youtube_url 분기).
+  type YoutubeResult = { videoId: string; title: string; channelTitle: string; thumbnailUrl: string };
+  const [ytQuery, setYtQuery] = useState('');
+  const [ytResults, setYtResults] = useState<YoutubeResult[]>([]);
+  const [ytSearching, setYtSearching] = useState(false);
+  const [ytSelected, setYtSelected] = useState<YoutubeResult | null>(null);
+  const [ytTargetVersion, setYtTargetVersion] = useState<VersionEntry | null>(null);
+  const [ytAdvice, setYtAdvice] = useState<AdviceResult | 'loading' | 'error' | null>(null);
+
+  const searchYoutube = async () => {
+    if (!ytQuery.trim()) return;
+    setYtSearching(true);
+    try {
+      const data = await api(`/v1/youtube/search?q=${encodeURIComponent(ytQuery.trim())}`);
+      setYtResults(data?.items ?? []);
+    } catch { notify('검색하지 못했어요', '잠시 후 다시 시도해 주세요.'); }
+    finally { setYtSearching(false); }
+  };
+
+  const requestYoutubeAdvice = async () => {
+    if (!selected || !me || !ytSelected || !ytTargetVersion) return;
+    setYtAdvice('loading');
+    try {
+      const result: AdviceResult = await api(`/v1/projects/${selected.id}/advice`, {
+        method: 'POST',
+        body: {
+          user_id: me.user_id, target_version_id: ytTargetVersion.id,
+          ref_youtube_url: `https://www.youtube.com/watch?v=${ytSelected.videoId}`,
+          ref_youtube_title: ytSelected.title,
+        },
+      });
+      setYtAdvice(result);
+    } catch { setYtAdvice('error'); }
+  };
+
+  // 대형(formation) 구성 — 팀원의 lib/formation 이식(lib/formation.ts). 팀원 쪽도 Supabase에
+  // 저장하지 않는 순수 클라이언트 상태였다(새로고침하면 사라짐) — 그래서 여기도 서버 저장
+  // 없이 세션 동안만 프로젝트별로 기억한다. 3D 무대는 편집의 본질(x/z 좌표)과 무관한
+  // 장식이라 옮기지 않고, 실제 편집 표면이던 2D 무대만 View+PanResponder 로 옮긴다.
+  type FormationProjectState = { sections: FormationSection[]; totalSec: number; selectedSectionId: string };
+  const [formationByProject, setFormationByProject] = useState<Record<string, FormationProjectState>>({});
+  const formationIdRef = useRef(0);
+  const nextFormationId = () => { formationIdRef.current += 1; return `fs${formationIdRef.current}`; };
+  const [gridRows, setGridRows] = useState('3');
+  const [gridCols, setGridCols] = useState('3');
+  const [gridCount, setGridCount] = useState('9');
+  const [formationViewMode, setFormationViewMode] = useState<'2d' | '3d'>('3d');
+
+  const ensureFormation = (projectId: string, defaultDurationSec: number) => {
+    setFormationByProject(prev => {
+      if (prev[projectId]) return prev;
+      const total = Math.max(10, Math.round(defaultDurationSec || 240));
+      const section: FormationSection = { id: nextFormationId(), name: '인트로', startSec: 0, endSec: total, formation: { dancers: [] } };
+      return { ...prev, [projectId]: { sections: [section], totalSec: total, selectedSectionId: section.id } };
+    });
+  };
+
+  const updateFormation = (fn: (proj: FormationProjectState) => FormationProjectState) => {
+    if (!selected) return;
+    setFormationByProject(prev => {
+      const proj = prev[selected.id];
+      if (!proj) return prev;
+      return { ...prev, [selected.id]: fn(proj) };
+    });
+  };
+  const mapFormationSections = (proj: FormationProjectState, sectionId: string, fn: (s: FormationSection) => FormationSection): FormationSection[] =>
+    proj.sections.map(s => (s.id === sectionId ? fn(s) : s));
+
+  // 구간은 항상 영상 전체 길이(totalSec)를 남거나 모자라지 않게 똑같이 나눠 채운다 — 구간을
+  // 추가/삭제해도 영상 길이 자체가 늘어나지 않고, 그 길이 안에서 조각의 개수만 바뀐다.
+  const redistributeFormationSections = (sections: FormationSection[], totalSec: number): FormationSection[] => {
+    const count = sections.length || 1;
+    const slice = totalSec / count;
+    return sections.map((sec, i) => ({ ...sec, startSec: Math.round(i * slice), endSec: i === count - 1 ? totalSec : Math.round((i + 1) * slice) }));
+  };
+
+  const addFormationSection = () => updateFormation(proj => {
+    const section: FormationSection = { id: nextFormationId(), name: `구간 ${proj.sections.length + 1}`, startSec: 0, endSec: 0, formation: { dancers: [] } };
+    return { ...proj, sections: redistributeFormationSections([...proj.sections, section], proj.totalSec), selectedSectionId: section.id };
+  });
+  const selectFormationSection = (id: string) => updateFormation(proj => ({ ...proj, selectedSectionId: id }));
+  const removeFormationSection = (id: string) => updateFormation(proj => {
+    const remaining = proj.sections.filter(s => s.id !== id);
+    if (!remaining.length) return proj;
+    const sections = redistributeFormationSections(remaining, proj.totalSec);
+    return { ...proj, sections, selectedSectionId: proj.selectedSectionId === id ? sections[0].id : proj.selectedSectionId };
+  });
+  const renameFormationSection = (id: string, name: string) => updateFormation(proj => ({ ...proj, sections: mapFormationSections(proj, id, s => ({ ...s, name })) }));
+  const setFormationSectionTiming = (id: string, startSec: number, endSec: number) => updateFormation(proj => ({ ...proj, sections: mapFormationSections(proj, id, s => ({ ...s, startSec, endSec })) }));
+
+  const applyFormationGrid = (sectionId: string, rows: number, cols: number, count: number) => updateFormation(proj => ({
+    ...proj, sections: mapFormationSections(proj, sectionId, s => ({ ...s, formation: makeGridFormation(rows, cols, count) })),
+  }));
+  const moveFormationDancer = (sectionId: string, dancerId: string, x: number, z: number) => updateFormation(proj => ({
+    ...proj, sections: mapFormationSections(proj, sectionId, s => ({ ...s, formation: { dancers: s.formation.dancers.map(d => d.id === dancerId ? { ...d, x, z } : d) } })),
+  }));
+  const addFormationDancer = (sectionId: string) => updateFormation(proj => ({
+    ...proj, sections: mapFormationSections(proj, sectionId, s => ({ ...s, formation: { dancers: [...s.formation.dancers, makeEmptyDancer(s.formation.dancers.length)] } })),
+  }));
+  const removeFormationDancer = (sectionId: string, dancerId: string) => updateFormation(proj => ({
+    ...proj, sections: mapFormationSections(proj, sectionId, s => ({ ...s, formation: { dancers: s.formation.dancers.filter(d => d.id !== dancerId) } })),
+  }));
+  const renameFormationDancer = (sectionId: string, dancerId: string, label: string) => updateFormation(proj => ({
+    ...proj, sections: mapFormationSections(proj, sectionId, s => ({ ...s, formation: { dancers: s.formation.dancers.map(d => d.id === dancerId ? { ...d, label } : d) } })),
+  }));
+
   const [editOpen, setEditOpen] = useState(false);
   const [editDraft, setEditDraft] = useState<{ name: string; license: License }>({ name: '', license: '리믹스 허용' });
   const [deleteConfirm, setDeleteConfirm] = useState('');
@@ -423,9 +862,18 @@ export default function App() {
   const attachProposalVideo = async (nextAsset: MotionAsset) => {
     setProposeAsset(nextAsset); setProposeMotion(null);
     await uploadForAnalysis(nextAsset, setProposeJob,
-      started => setProposeMotion({ source_sha256: started.source_sha256, video_url: started.video_url,
-                                    width: started.width, height: started.height, frame_count: started.frame_count,
-                                    fps: started.fps, duration_ms: durationOf(started) }),
+      started => {
+        const duration_ms = durationOf(started);
+        setProposeMotion({ source_sha256: started.source_sha256, video_url: started.video_url,
+                          width: started.width, height: started.height, frame_count: started.frame_count,
+                          fps: started.fps, duration_ms });
+        // 시작 시각이 이미 적혀 있으면 이 영상 길이만큼 끝을 바로 채운다 — 영상을 나중에
+        // 올린 경우에도 자동 계산이 똑같이 적용되도록.
+        setProposeDraft(draft => {
+          const autoTo = autoEndFromClip(draft.from, duration_ms);
+          return autoTo ? { ...draft, to: autoTo } : draft;
+        });
+      },
       result => setProposeMotion(current => ({ ...(current ?? {}), frame_count: result.frame_count ?? 0 })));
   };
 
@@ -446,6 +894,51 @@ export default function App() {
   const selected: Project | null = remoteProjects.find(item => item.id === selectedId) ?? remoteProjects[0] ?? null;
   const collaborators = selected?.collaborators ?? [];
   const canEdit = !!selected && (selected.isOwner || selected.viewerPermission === '직접 수정');
+
+  useEffect(() => {
+    if (page !== 'practiceLog' || !selected) return;
+    setPracticeRuns('loading');
+    api(`/v1/projects/${selected.id}/practice`).then(data => setPracticeRuns(data?.runs ?? [])).catch(() => setPracticeRuns('error'));
+  }, [page, selected?.id]);
+
+  const formationState = selected ? formationByProject[selected.id] : undefined;
+  const formationSection = formationState?.sections.find(s => s.id === formationState.selectedSectionId) ?? formationState?.sections[0];
+  // 대형 구성의 전체 길이는 그 작업의 실제 영상 길이(workMs)를 따라간다. 처음 열 때뿐 아니라
+  // workMs 가 나중에 바뀌어도(예: 영상이 늦게 로드되거나 더 긴 버전이 반영됨) 다시 맞춘다.
+  // 구간은 항상 이 길이를 똑같이 나눠 채우므로, 길이가 바뀌면 개수는 그대로 두고 다시 나눈다.
+  useEffect(() => {
+    if (page !== 'formation' || !selected) return;
+    const videoSec = Math.max(10, Math.round((selected.workMs ?? 0) / 1000)) || 240;
+    if (!formationByProject[selected.id]) {
+      ensureFormation(selected.id, videoSec);
+      return;
+    }
+    setFormationByProject(prev => {
+      const proj = prev[selected.id];
+      if (!proj || proj.totalSec === videoSec) return prev;
+      return { ...prev, [selected.id]: { ...proj, totalSec: videoSec, sections: redistributeFormationSections(proj.sections, videoSec) } };
+    });
+  }, [page, selected?.id, selected?.workMs]);
+
+  // 구간 시작·끝을 손으로 입력할 수 있게 하는 입력창 — 값은 mm:ss 자유 텍스트로 두고
+  // "적용"을 눌렀을 때만 파싱한다(제안 시트의 from/to 입력과 같은 방식). 선택한 구간이
+  // 바뀌거나 값이 반영되면 입력창을 그 구간의 현재 값으로 다시 맞춘다.
+  const [formationTimingDraft, setFormationTimingDraft] = useState({ from: '', to: '' });
+  useEffect(() => {
+    if (formationSection) setFormationTimingDraft({ from: fmtMs(formationSection.startSec * 1000), to: fmtMs(formationSection.endSec * 1000) });
+  }, [formationSection?.id, formationSection?.startSec, formationSection?.endSec]);
+
+  const applyFormationTiming = () => {
+    if (!formationSection || !formationState) return;
+    const from = parseClock(formationTimingDraft.from);
+    const to = parseClock(formationTimingDraft.to);
+    if (from === null || to === null) return notify('시간 형식을 확인해 주세요', '0:08 처럼 분:초로 적어 주세요.');
+    if (to <= from) return notify('구간을 확인해 주세요', '끝 시간이 시작 시간보다 뒤여야 해요.');
+    const startSec = Math.max(0, from / 1000);
+    const endSec = Math.min(formationState.totalSec, to / 1000);
+    if (endSec <= startSec) return notify('구간을 확인해 주세요', `작품 길이(${fmtMs(formationState.totalSec * 1000)}) 안에서 지정해 주세요.`);
+    setFormationSectionTiming(formationSection.id, startSec, endSec);
+  };
 
   const refresh = async (userId = me?.user_id) => {
     if (!userId) return;
@@ -577,6 +1070,24 @@ export default function App() {
     playbackRef.current = 0; liveFrameRef.current = 0;
     setStageMode(stageMode === 'original' ? 'overlay' : stageMode);
     go('overlay');
+  };
+
+  // 원본 영상 + 이 버전의 구간 영상을 실제로 이어붙인 하나의 영상을 만들어(서버가 ffmpeg 으로
+  // 합성) 그 자리에서 재생한다. "구간 영상 보기"는 그 구간만 따로 보여주는 것과 다르다 —
+  // 이건 이 수정이 작품 전체 흐름 안에서 어떻게 보이는지 미리 보는 것이다.
+  const [mergingVersionId, setMergingVersionId] = useState<string | null>(null);
+  const viewMergedVersion = async (version: VersionEntry) => {
+    if (!selected) return;
+    setMergingVersionId(version.id);
+    try {
+      const result = await api(`/v1/projects/${selected.id}/versions/${version.id}/merged`);
+      if (!result?.url) throw new Error('합친 영상을 만들지 못했어요.');
+      await Linking.openURL(new URL(result.url, API).toString());
+    } catch (error: any) {
+      notify('합친 영상을 보지 못했어요', error?.message ?? '다시 시도해 주세요.');
+    } finally {
+      setMergingVersionId(null);
+    }
   };
 
   const closeVersionClip = () => {
@@ -912,7 +1423,13 @@ export default function App() {
             <Text style={s.label}>고친 구간 · 분:초 <Text style={s.required}>필수</Text></Text>
             <View style={s.countRow}>
               <TextInput placeholder="0:08" placeholderTextColor="#6E7C86" value={proposeDraft.from}
-                onChangeText={text => setProposeDraft(draft => ({ ...draft, from: text.replace(/[^0-9:]/g, '') }))} style={[s.input, s.countInput]}/>
+                onChangeText={text => {
+                  const from = text.replace(/[^0-9:]/g, '');
+                  setProposeDraft(draft => {
+                    const autoTo = autoEndFromClip(from, proposeMotion?.duration_ms);
+                    return { ...draft, from, to: autoTo ?? draft.to };
+                  });
+                }} style={[s.input, s.countInput]}/>
               <Text style={s.countDash}>–</Text>
               <TextInput placeholder="0:16" placeholderTextColor="#6E7C86" value={proposeDraft.to}
                 onChangeText={text => setProposeDraft(draft => ({ ...draft, to: text.replace(/[^0-9:]/g, '') }))} style={[s.input, s.countInput]}/>
@@ -922,6 +1439,7 @@ export default function App() {
               const grows = end !== null && !!selected?.workMs && end > selected.workMs;
               return <>
                 <Text style={s.countHint}>{selected?.workMs ? `이 작업은 ${fmtMs(selected.workMs)} 길이입니다. ` : ''}어느 부분을 고쳤는지 없으면 크레딧을 나눌 수 없어 반드시 적어야 합니다.</Text>
+                {proposeMotion?.duration_ms ? <Text style={s.countHint}>구간 영상 길이({fmtMs(proposeMotion.duration_ms)})만큼 시작 시각에 맞춰 끝 시각이 자동으로 채워져요. 필요하면 끝 시각을 직접 고쳐도 돼요.</Text> : null}
                 {grows ? <Text style={s.growHint}>작품이 {fmtMs(selected!.workMs!)} → {fmtMs(end!)} 로 길어집니다. 뒤로 늘리는 수정이면 그대로 보내세요.</Text> : null}
               </>;
             })()}
@@ -1008,6 +1526,8 @@ export default function App() {
         <View style={s.versionActions}>
           {item.sourceSha256 ? <Pressable style={s.headBtn} onPress={() => openVersionClip(item)}>
             <Text style={s.headBtnText}>구간 영상 보기</Text></Pressable> : null}
+          {item.sourceSha256 && item.startMs !== null ? <Pressable style={[s.headBtn, mergingVersionId === item.id && s.primaryDisabled]} onPress={() => viewMergedVersion(item)}>
+            <Text style={s.headBtnText}>{mergingVersionId === item.id ? '합치는 중…' : '합쳐진 영상 보기'}</Text></Pressable> : null}
           {!isHead && versions.canDecide ? <Pressable style={[s.headBtn, busy && s.primaryDisabled]} onPress={() => setHead(item)}>
             <Text style={s.headBtnText}>이 버전을 현재로</Text></Pressable> : null}
         </View>
@@ -1027,7 +1547,7 @@ export default function App() {
       <Text style={s.countHint}>거절된 제안도 지우지 않고 남깁니다 — 무엇이 논의됐는지가 기록의 일부입니다.</Text>
     </> : null}
 
-    <View style={s.grid}>{[['▶','영상 · 오버레이','overlay'],['⌘','포즈 데이터','data'],['✦','작업 기록','passport'],['♧','협업 공간','collab']].map(([icon,label,target])=><Pressable key={label} style={s.action} onPress={()=>go(target as Page)}><Text style={s.actionIcon}>{icon}</Text><Text style={s.actionText}>{label}</Text></Pressable>)}</View>
+    <View style={s.grid}>{[['▶','영상 · 오버레이','overlay'],['⌘','포즈 데이터','data'],['✦','작업 기록','passport'],['♧','협업 공간','collab'],['◈','버전 비교','analysis'],['🎥','실시간 연습','live'],['≡','연습 기록','practiceLog'],['▷','유튜브 비교','youtube'],['◆','대형 구성','formation']].map(([icon,label,target])=><Pressable key={label} style={s.action} onPress={()=>go(target as Page)}><Text style={s.actionIcon}>{icon}</Text><Text style={s.actionText}>{label}</Text></Pressable>)}</View>
   </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
   const VersionRow = ({title,copy,color}:{title:string;copy:string;color:string}) => <View style={s.versionRow}><View style={[s.status,{backgroundColor:color}]}/><View style={s.grow}><Text style={s.versionTitle}>{title}</Text><Text style={s.meta}>{copy}</Text></View></View>;
   // 예전에는 '원본 영상'과 '모션 오버레이'가 별도 화면이었는데, 오버레이 화면의 '원본'
@@ -1146,9 +1666,232 @@ export default function App() {
     </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
   };
 
-  const Analysis = () => <SafeAreaView style={s.safe}><Header title="파생 관계" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}><Text style={s.eyebrow}>FORK & CREDIT</Text><Text style={s.title}>원작과 새 작업을{`\n`}정직하게 연결하세요.</Text><View style={s.scoreCard}><Text style={s.scoreLabel}>연결된 원작</Text><Text style={s.score}>01</Text><Text style={s.meta}>Tide marks · ver.3</Text><View style={s.track}><View style={s.fill}/></View></View><View style={s.sourceResult}><Text style={s.sourceResultLabel}>이용 허락</Text><Text style={s.sourceResultTitle}>리믹스 허용 · 크레딧 필수</Text><Text style={s.sourceResultCopy}>원작자, 변경 구간, 새 기여자를 Passport와 버전 이력에 함께 남깁니다.</Text><Pill name="원작 연결됨"/></View><Text style={s.section}>수정 범위</Text>{[['01–04','원작 동작 유지','#4FC7A2'],['05–08','팔 동작 변형 · BADA','#E0AE3C'],['09–12','전환 동선 추가 · MIA','#B490E8']].map(([count,copy,color])=><Pressable key={count} style={s.analysis} onPress={()=>go('motion')}><View style={[s.status,{backgroundColor:color}]}/><View style={s.grow}><Text style={s.count}>{count} COUNT</Text><Text style={s.analysisCopy}>{copy}</Text></View><Text style={s.chev}>›</Text></Pressable>)}<Pressable style={s.secondary} onPress={()=>go('motion')}><Text style={s.secondaryText}>변경 구간 기록하기</Text></Pressable></ScrollView><Bottom page="home" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
-  const Motion = () => <SafeAreaView style={s.safe}><Header title="수정 제안 상세" back={() => go('analysis')}/><ScrollView contentContainerStyle={s.content}><View style={s.stage}><Text style={s.stageTag}>COUNT 05–08</Text><Text style={s.skeleton}>●{`\n`}╱│╲{`\n`} ╱ ╲</Text><View style={s.joint}><Text style={s.jointName}>변경 제안</Text><Text style={s.jointValue}>BADA</Text></View></View><Text style={s.section}>기여 기록</Text><Tip index="01" title="팔 동작을 새롭게 구성했어요" copy="원작의 중심 이동은 유지하고, 양팔의 궤적을 새 버전으로 제안합니다."/><Tip index="02" title="크레딧과 변경 이유를 남겨요" copy="승인되면 기여자와 변경 구간이 버전 이력에 자동으로 연결됩니다."/><Pressable style={s.primary} onPress={()=>notify('수정 제안 저장','수정 범위와 기여 기록을 저장했습니다.')}><Text style={s.primaryText}>수정 제안 저장</Text></Pressable></ScrollView><Bottom page="home" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  // 팀원 Next.js 프로젝트의 "비교" 기능 이식. 여기서는 HEAD 대 이 작업의 다른 반영된
+  // 버전을 비교한다(외부 레퍼런스 업로드·유튜브 비교는 다음 단계).
+  const Analysis = () => {
+    const chain = versions?.main ?? [];
+    const head = chain.find(item => item.id === versions?.headId) ?? chain[chain.length - 1];
+    const others = chain.filter(item => item.id !== head?.id && item.sourceSha256);
+    return <SafeAreaView style={s.safe}><Header title="버전 비교" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}>
+      <Text style={s.eyebrow}>POSE COMPARE</Text><Text style={s.title}>지금 버전과{`\n`}다른 버전을 견줘보세요.</Text>
+      <Text style={s.countHint}>33개 관절의 각도를 프레임마다 맞춰(DTW) 얼마나 비슷하게 움직였는지 채점합니다. 좌우가 반전된 영상도 자동으로 알아챕니다.</Text>
+      {head ? <View style={s.compareBaseCard}><Text style={s.compareBaseLabel}>현재 버전 (기준)</Text><Text style={s.compareBaseTitle}>v{head.number} · {head.segment}</Text></View> : null}
+      <Text style={s.section}>비교할 버전</Text>
+      {others.length ? others.map(item => <Pressable key={item.id} style={s.overlayRow} onPress={() => { runCompare(item); go('motion'); }}>
+        <Text style={s.overlayTime}>v{item.number}</Text>
+        <Text style={s.overlayLabel}>{item.title} · {item.authorName}</Text>
+        <Text style={s.recordCheck}>›</Text>
+      </Pressable>) : <Text style={s.meta}>영상이 붙은 다른 버전이 아직 없어요. 구간 영상을 첨부한 제안이 반영되면 여기 나타납니다.</Text>}
+    </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  };
+  const Motion = () => {
+    const r = compareResult;
+    return <SafeAreaView style={s.safe}><Header title="비교 결과" back={() => go('analysis')}/><ScrollView contentContainerStyle={s.content}>
+      <Text style={s.eyebrow}>POSE COMPARE</Text>
+      <Text style={s.title}>{compareTarget ? `v${compareTarget.number} 과의 비교` : '비교 결과'}</Text>
+
+      {r === 'loading' ? <View style={s.compareBaseCard}><Text style={s.meta}>DTW로 프레임을 맞추는 중…</Text></View> : null}
+      {r === 'error' ? <View style={s.compareBaseCard}><Text style={s.meta}>비교하지 못했어요. 두 버전 모두 포즈 데이터가 있어야 합니다.</Text></View> : null}
+
+      {r && r !== 'loading' && r !== 'error' ? <>
+        <View style={s.scoreCard}>
+          <Text style={s.scoreLabel}>일치율</Text>
+          <Text style={s.score}>{Math.round(r.overallScore)}<Text style={{ fontSize: 20 }}>%</Text></Text>
+          <View style={s.track}><View style={[s.fill, { width: `${r.overallScore}%` }]}/></View>
+          {r.mirrored ? <Text style={s.meta}>좌우가 반전된 영상으로 인식해 자동으로 뒤집어 비교했어요.</Text> : null}
+          {r.lowVisibility ? <Text style={s.growHint}>일부 구간은 관절이 잘 안 보여 점수 신뢰도가 낮을 수 있어요.</Text> : null}
+        </View>
+
+        <Text style={s.section}>가장 차이 나는 관절</Text>
+        {(r.segments[0]?.worstJoints ?? []).map(joint => <View key={joint.joint} style={s.overlayRow}>
+          <Text style={s.overlayLabel}>{joint.joint}</Text>
+          <Text style={s.compareJointDiff}>평균 {joint.avgDiffDeg}°</Text>
+        </View>)}
+        {!(r.segments[0]?.worstJoints ?? []).length ? <Text style={s.meta}>두 버전이 거의 똑같이 움직였어요.</Text> : null}
+
+        <Text style={s.section}>AI 코치의 조언</Text>
+        {adviceResult === null ? <Pressable style={s.primary} onPress={requestAdvice}><Text style={s.primaryText}>영상 보고 조언 받기</Text></Pressable> : null}
+        {adviceResult === 'loading' ? <View style={s.compareBaseCard}><Text style={s.meta}>두 영상을 Gemini 에 올려 분석하는 중… (최대 1~2분)</Text></View> : null}
+        {adviceResult === 'error' ? <>
+          <View style={s.compareBaseCard}><Text style={s.meta}>조언을 받지 못했어요. 서버에 GEMINI_API_KEY 가 설정돼 있는지 확인해주세요.</Text></View>
+          <Pressable style={s.primary} onPress={requestAdvice}><Text style={s.primaryText}>다시 시도</Text></Pressable>
+        </> : null}
+        {adviceResult && adviceResult !== 'loading' && adviceResult !== 'error' ? <>
+          <View style={s.compareBaseCard}><Text style={s.overlayLabel}>총평</Text><Text style={[s.meta, { marginTop: 6 }]}>{adviceResult.overallComment}</Text></View>
+          {adviceResult.segments.map((seg, i) => <Tip key={i}
+            index={`${seg.start.toFixed(1)}–${seg.end.toFixed(1)}s`}
+            title={seg.whatsWrong}
+            copy={`왜: ${seg.why}\n\n어떻게: ${seg.howToFix}`}
+          />)}
+        </> : null}
+      </> : null}
+    </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  };
+  const Live = () => {
+    if (!isLiveSupported()) {
+      return <SafeAreaView style={s.safe}><Header title="실시간 연습" back={() => { resetLive(); go('version'); }}/><ScrollView contentContainerStyle={s.content}>
+        <View style={s.compareBaseCard}><Text style={s.meta}>이 기능은 웹 브라우저(Chrome/Edge)에서만 지원돼요. 앱에서는 아직 쓸 수 없어요.</Text></View>
+      </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+    }
+    return <SafeAreaView style={s.safe}><Header title="실시간 연습" back={() => { resetLive(); go('version'); }}/><ScrollView contentContainerStyle={s.content}>
+      <Text style={s.eyebrow}>LIVE PRACTICE</Text>
+      <Text style={s.title}>웹캠 보며 따라 추기</Text>
+
+      <View style={s.liveVideoWrap}>
+        <View ref={refWrapRef} style={StyleSheet.absoluteFill}/>
+        <View style={s.liveTag}><Text style={s.liveTagText}>레퍼런스 · {selected?.name}</Text></View>
+      </View>
+      <View style={s.liveVideoWrap}>
+        <View ref={camWrapRef} style={StyleSheet.absoluteFill}/>
+        <View style={s.liveTag}><Text style={s.liveTagText}>내 웹캠</Text></View>
+        {liveStatus === 'running' ? <View style={s.liveScoreBadge}>
+          <Text style={s.liveScoreText}>{liveScore}%</Text>
+          {livePhrase ? <Text style={s.livePhraseText}>{livePhrase}</Text> : null}
+        </View> : null}
+      </View>
+
+      {liveStatus === 'running' ? <View style={s.track}><View style={[s.fill, { width: `${liveProgress}%` }]}/></View> : null}
+
+      {liveError ? <View style={s.compareBaseCard}><Text style={s.meta}>{liveError}</Text></View> : null}
+
+      {liveStatus === 'idle' ? <Pressable style={s.primary} onPress={startLiveCamera}><Text style={s.primaryText}>📷 카메라 켜기</Text></Pressable> : null}
+      {(liveStatus === 'requesting-camera' || liveStatus === 'loading-model') ? <Text style={s.meta}>{liveStatus === 'requesting-camera' ? '카메라 권한을 요청하는 중…' : '포즈 인식 모델을 불러오는 중…'}</Text> : null}
+      {liveStatus === 'ready' ? <>
+        <Pressable style={s.overlayRow} onPress={() => setLiveMirrored(v => !v)}>
+          <Text style={s.overlayLabel}>좌우 반전(거울모드)</Text>
+          <Text style={s.compareJointDiff}>{liveMirrored ? 'ON' : 'OFF'}</Text>
+        </Pressable>
+        <Pressable style={s.primary} onPress={startLiveSession}><Text style={s.primaryText}>▶ 시작 (영상이 재생돼요)</Text></Pressable>
+      </> : null}
+      {liveStatus === 'running' ? <Pressable style={[s.primary, s.primaryDisabled]} onPress={stopLiveEarly}><Text style={s.primaryText}>⏹ 종료하고 저장</Text></Pressable> : null}
+      {liveStatus === 'finishing' ? <Text style={s.meta}>{liveJob ? stageLabel(liveJob.stage, liveJob.done, liveJob.total) : '결과를 정리하는 중…'}</Text> : null}
+      {liveStatus === 'done' ? <>
+        <View style={s.compareBaseCard}><Text style={s.meta}>연습 기록으로 저장했어요 — 안무 자체는 그대로예요. 작업 기록(버전 목록)에는 나타나지 않아요.</Text></View>
+        <Pressable style={s.primary} onPress={() => { resetLive(); }}><Text style={s.primaryText}>다시 연습하기</Text></Pressable>
+      </> : null}
+      {liveStatus === 'error' ? <Pressable style={s.primary} onPress={() => { resetLive(); }}><Text style={s.primaryText}>처음부터 다시</Text></Pressable> : null}
+    </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  };
   const Tip = ({index,title,copy}:{index:string;title:string;copy:string}) => <View style={s.tip}><Text style={s.tipIndex}>{index}</Text><View style={s.grow}><Text style={s.tipTitle}>{title}</Text><Text style={s.tipCopy}>{copy}</Text></View></View>;
+  const Youtube = () => {
+    const withVideo = (versions?.main ?? []).filter(item => item.sourceSha256);
+    return <SafeAreaView style={s.safe}><Header title="유튜브 비교" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}>
+      <Text style={s.eyebrow}>YOUTUBE REFERENCE</Text>
+      <Text style={s.title}>유튜브 영상과{`\n`}동작을 비교해보세요.</Text>
+      <Text style={s.countHint}>유튜브 영상엔 포즈 데이터가 없어 점수는 낼 수 없지만, Gemini 가 두 영상을 직접 보고 무엇이 다른지 말로 설명해줘요.</Text>
+
+      <Text style={s.section}>내 영상</Text>
+      {withVideo.length ? withVideo.map(item => <Pressable key={item.id} style={s.overlayRow} onPress={() => setYtTargetVersion(item)}>
+        <Text style={s.overlayTime}>v{item.number}</Text>
+        <Text style={s.overlayLabel}>{item.title} · {item.authorName}</Text>
+        <Text style={s.recordCheck}>{ytTargetVersion?.id === item.id ? '✓' : '›'}</Text>
+      </Pressable>) : <Text style={s.meta}>영상이 붙은 버전이 아직 없어요.</Text>}
+
+      <Text style={s.section}>유튜브에서 레퍼런스 찾기</Text>
+      <TextInput placeholder="예: 지수 dance tutorial" placeholderTextColor="#6E7C86" value={ytQuery} onChangeText={setYtQuery} onSubmitEditing={searchYoutube} style={s.input}/>
+      <Pressable style={[s.primary, ytSearching && s.primaryDisabled]} onPress={searchYoutube}><Text style={s.primaryText}>{ytSearching ? '검색 중…' : '검색'}</Text></Pressable>
+
+      {ytResults.map(item => <Pressable key={item.videoId} style={s.overlayRow} onPress={() => setYtSelected(item)}>
+        <Text style={s.overlayLabel}>{item.title}</Text>
+        <Text style={s.recordCheck}>{ytSelected?.videoId === item.videoId ? '✓' : '›'}</Text>
+      </Pressable>)}
+
+      {ytTargetVersion && ytSelected ? <Pressable style={s.primary} onPress={requestYoutubeAdvice}><Text style={s.primaryText}>AI 조언 받기</Text></Pressable> : null}
+      {ytAdvice === 'loading' ? <View style={s.compareBaseCard}><Text style={s.meta}>두 영상을 Gemini 에 올려 비교하는 중… (최대 1~2분)</Text></View> : null}
+      {ytAdvice === 'error' ? <View style={s.compareBaseCard}><Text style={s.meta}>조언을 받지 못했어요. 다시 시도해주세요.</Text></View> : null}
+      {ytAdvice && ytAdvice !== 'loading' && ytAdvice !== 'error' ? <>
+        <View style={s.compareBaseCard}><Text style={s.overlayLabel}>총평</Text><Text style={[s.meta, { marginTop: 6 }]}>{ytAdvice.overallComment}</Text></View>
+        {ytAdvice.segments.map((seg, i) => <Tip key={i}
+          index={`${seg.start.toFixed(1)}–${seg.end.toFixed(1)}s`}
+          title={seg.whatsWrong}
+          copy={`왜: ${seg.why}\n\n어떻게: ${seg.howToFix}`}
+        />)}
+      </> : null}
+    </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  };
+  const Formation = () => {
+    if (!formationState || !formationSection) {
+      return <SafeAreaView style={s.safe}><Header title="대형 구성" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}>
+        <Text style={s.meta}>불러오는 중…</Text>
+      </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+    }
+    return <SafeAreaView style={s.safe}><Header title="대형 구성" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}>
+      <Text style={s.eyebrow}>FORMATION</Text>
+      <Text style={s.title}>구간별로{`\n`}댄서 위치를 짜보세요.</Text>
+      <Text style={s.countHint}>이 화면의 배치는 저장되지 않고 앱을 새로고침하면 사라져요 — 자리 구상용 스케치판이에요. 무대를 눌러 댄서를 추가하고, 드래그로 옮기세요.</Text>
+      <Text style={s.meta}>작품 길이 {fmtMs(formationState.totalSec * 1000)}에 맞춰 구간을 나눠요.</Text>
+
+      <View style={s.chipsRow}>
+        {formationState.sections.map(sec => <Pressable key={sec.id} style={[s.formationChip, sec.id === formationState.selectedSectionId && s.formationChipOn]} onPress={() => selectFormationSection(sec.id)}>
+          <Text style={[s.formationChipText, sec.id === formationState.selectedSectionId && s.formationChipTextOn]}>{sec.name}</Text>
+        </Pressable>)}
+        <Pressable style={s.formationChip} onPress={addFormationSection}><Text style={s.formationChipText}>+ 구간</Text></Pressable>
+      </View>
+      <View style={s.overlayRow}>
+        <TextInput value={formationSection.name} onChangeText={text => renameFormationSection(formationSection.id, text)} style={[s.input, { flex: 1, marginBottom: 0 }]}/>
+        {formationState.sections.length > 1 ? <Pressable onPress={() => removeFormationSection(formationSection.id)}><Text style={s.recordCheck}>삭제</Text></Pressable> : null}
+      </View>
+      <View style={s.gridInputsRow}>
+        <TextInput placeholder="0:00" placeholderTextColor="#6E7C86" value={formationTimingDraft.from} onChangeText={text => setFormationTimingDraft(draft => ({ ...draft, from: text }))} style={[s.input, { width: 70, marginBottom: 0 }]}/>
+        <Text style={s.meta}>~</Text>
+        <TextInput placeholder="0:20" placeholderTextColor="#6E7C86" value={formationTimingDraft.to} onChangeText={text => setFormationTimingDraft(draft => ({ ...draft, to: text }))} style={[s.input, { width: 70, marginBottom: 0 }]}/>
+        <Pressable style={s.formationChip} onPress={applyFormationTiming}><Text style={s.formationChipText}>적용</Text></Pressable>
+      </View>
+
+      <View style={s.chipsRow}>
+        <Pressable style={[s.formationChip, formationViewMode === '3d' && s.formationChipOn]} onPress={() => setFormationViewMode('3d')}><Text style={[s.formationChipText, formationViewMode === '3d' && s.formationChipTextOn]}>3D 무대</Text></Pressable>
+        <Pressable style={[s.formationChip, formationViewMode === '2d' && s.formationChipOn]} onPress={() => setFormationViewMode('2d')}><Text style={[s.formationChipText, formationViewMode === '2d' && s.formationChipTextOn]}>2D 무대(드래그 편집)</Text></Pressable>
+      </View>
+
+      {formationViewMode === '3d' ? <>
+        <FormationStage3D dancers={formationSection.formation.dancers} style={s.formationStageWrap}/>
+        <Text style={s.meta}>드래그로 돌려보고, 댄서를 눌러 확인하세요. 위치를 옮기려면 2D 무대를 쓰세요.</Text>
+      </> : <>
+        <View style={s.formationStageWrap}>
+          {formationSection.formation.dancers.map(d => <DancerToken key={d.id} dancer={d} sectionId={formationSection.id} onMove={moveFormationDancer}/>)}
+        </View>
+        <Pressable style={s.formationChip} onPress={() => addFormationDancer(formationSection.id)}><Text style={s.formationChipText}>+ 인원 추가</Text></Pressable>
+      </>}
+
+      <Text style={s.section}>격자로 한 번에 배치</Text>
+      <View style={s.gridInputsRow}>
+        <TextInput value={gridRows} onChangeText={setGridRows} keyboardType="number-pad" style={s.gridInput} placeholder="행"/>
+        <TextInput value={gridCols} onChangeText={setGridCols} keyboardType="number-pad" style={s.gridInput} placeholder="열"/>
+        <TextInput value={gridCount} onChangeText={setGridCount} keyboardType="number-pad" style={s.gridInput} placeholder="인원"/>
+        <Pressable style={s.formationChip} onPress={() => applyFormationGrid(formationSection.id, Math.max(1, Number(gridRows) || 1), Math.max(1, Number(gridCols) || 1), Math.max(1, Number(gridCount) || 1))}>
+          <Text style={s.formationChipText}>배치</Text>
+        </Pressable>
+      </View>
+
+      <Text style={s.section}>댄서 목록</Text>
+      {formationSection.formation.dancers.map(d => <View key={d.id} style={s.overlayRow}>
+        <TextInput value={d.label} onChangeText={text => renameFormationDancer(formationSection.id, d.id, text)} style={[s.input, { flex: 1, marginBottom: 0 }]}/>
+        <Text style={s.compareJointDiff}>{d.x.toFixed(1)}, {d.z.toFixed(1)}</Text>
+        <Pressable onPress={() => removeFormationDancer(formationSection.id, d.id)}><Text style={s.recordCheck}>×</Text></Pressable>
+      </View>)}
+      <Pressable style={s.formationChip} onPress={() => addFormationDancer(formationSection.id)}><Text style={s.formationChipText}>+ 댄서 추가</Text></Pressable>
+    </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  };
+  const PracticeLog = () => {
+    const r = practiceRuns;
+    return <SafeAreaView style={s.safe}><Header title="연습 기록" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}>
+      <Text style={s.eyebrow}>PRACTICE LOG</Text>
+      <Text style={s.title}>웹캠 연습{`\n`}기록을 모아봐요.</Text>
+      <Text style={s.countHint}>여기는 연습한 결과만 모아요 — 안무 자체를 바꾸는 수정 제안·버전과는 분리되어 있어서, 아무리 연습해도 작업 기록(버전)에는 나타나지 않아요.</Text>
+
+      {r === 'loading' ? <Text style={s.meta}>불러오는 중…</Text> : null}
+      {r === 'error' ? <Text style={s.meta}>연습 기록을 불러오지 못했어요.</Text> : null}
+      {r && r !== 'loading' && r !== 'error' && r.length === 0 ? <Text style={s.meta}>아직 연습 기록이 없어요. "실시간 연습"에서 웹캠으로 따라 추면 여기 쌓여요.</Text> : null}
+      {r && r !== 'loading' && r !== 'error' ? r.map(run => <View key={run.id} style={s.compareBaseCard}>
+        <View style={s.overlayRow}>
+          <Text style={s.compareBaseTitle}>일치율 {run.overallScore != null ? Math.round(run.overallScore) : '?'}%</Text>
+          {run.mirrored ? <Text style={s.compareJointDiff}>반전 인식</Text> : null}
+        </View>
+        <Text style={s.meta}>{run.userName ?? '알 수 없음'} · {run.createdAt}</Text>
+        {run.videoUrl ? <Pressable style={s.formationChip} onPress={() => Linking.openURL(new URL(run.videoUrl!, API).toString())}><Text style={s.formationChipText}>녹화 다시 보기</Text></Pressable> : null}
+      </View>) : null}
+    </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
+  };
   const CollabSheet = () => {
     if (!collabEditing) return null;
     const editing = collabEditing !== 'new';
@@ -1519,7 +2262,7 @@ export default function App() {
   };
   const RecordGroup = ({title,items}:{title:string;items:string[]}) => <View style={s.recordGroup}><Text style={s.recordGroupTitle}>{title}</Text>{items.map(item=><View key={item} style={s.recordItem}><Text style={s.recordCheck}>✓</Text><Text style={s.recordItemText}>{item}</Text><Text style={s.recordArrow}>›</Text></View>)}</View>;
   const LicenseSettings = () => <SafeAreaView style={s.safe}><Header title="라이선스 설정" back={()=>go('profile')}/><ScrollView contentContainerStyle={s.content}><Text style={s.eyebrow}>DEFAULT PERMISSION</Text><Text style={s.title}>내 안무를 어떻게{`\n`}사용할 수 있나요?</Text>{(Object.keys(licenseColor) as License[]).map(item=><Pressable key={item} style={[s.license,license===item&&s.licenseOn]} onPress={()=>setLicense(item)}><View style={[s.radio,license===item&&{borderColor:licenseColor[item]}]}>{license===item&&<View style={[s.radioIn,{backgroundColor:licenseColor[item]}]}/>}</View><View style={s.grow}><Text style={s.licenseName}>{item}</Text><Text style={s.licenseCopy}>{item==='연습 전용'?'개인 열람과 연습만 허용합니다.':item==='비상업 커버 허용'?'출처 표기 시 비상업 영상 게시가 가능합니다.':item==='리믹스 허용'?'Fork와 2차 창작을 허용합니다.':'공연·광고·교육 사용 전 승인이 필요합니다.'}</Text></View></Pressable>)}<Pressable style={s.primary} onPress={()=>{notify('저장 완료', `${license}으로 기본 라이선스를 설정했습니다.`, 'ok');go('profile');}}><Text style={s.primaryText}>기본 설정 저장</Text></Pressable></ScrollView><Bottom page="profile" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
-  const pages: Record<Page,()=>React.JSX.Element> = { home:Home,library:Library,new:New,capture:Capture,version:Version,overlay:Overlay,data:Data,analysis:Analysis,motion:Motion,collab:Collab,perform:Perform,profile:Profile,community:CommunityPage,license:LicenseSettings,passport:Passport }; // 페이지를 요소(<Current/>)가 아니라 함수 호출로 그린다.
+  const pages: Record<Page,()=>React.JSX.Element> = { home:Home,library:Library,new:New,capture:Capture,version:Version,overlay:Overlay,data:Data,analysis:Analysis,motion:Motion,collab:Collab,perform:Perform,profile:Profile,community:CommunityPage,license:LicenseSettings,passport:Passport,live:Live,youtube:Youtube,formation:Formation,practiceLog:PracticeLog }; // 페이지를 요소(<Current/>)가 아니라 함수 호출로 그린다.
   // 이 화살표 함수들은 App 리렌더마다 새로 만들어져 요소로 쓰면 타입이 매번 바뀌고,
   // React 가 트리를 통째로 remount 한다 — 진행률 폴링(600ms)마다 영상이 처음으로
   // 되감기는 원인이었다. 함수 호출은 JSX 를 App 의 트리에 그대로 펼치므로
@@ -1651,6 +2394,26 @@ Object.assign(s, {
   clipBannerMeta: { color: '#A2AFB9', fontSize: 12, marginTop: 4 },
   clipBannerBtn: { borderWidth: 1, borderColor: '#7FA5FF', borderRadius: 9, paddingHorizontal: 12, paddingVertical: 8 },
   clipBannerBtnText: { color: '#7FA5FF', fontSize: 12, fontWeight: '800' },
+  compareJointDiff: { color: '#4FC7A2', fontSize: 12.5, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  compareBaseCard: { backgroundColor: '#1B2740', borderWidth: 1, borderColor: '#33456B', borderRadius: 14, padding: 14 },
+  compareBaseLabel: { color: '#9DB8F5', fontSize: 11, fontWeight: '800' },
+  compareBaseTitle: { color: '#E8EDF2', fontSize: 15, fontWeight: '800', marginTop: 4 },
+  liveVideoWrap: { width: '100%', aspectRatio: 16 / 9, borderRadius: 14, overflow: 'hidden', backgroundColor: '#000', borderWidth: 1, borderColor: '#2A333B' },
+  liveTag: { position: 'absolute', left: 8, top: 8, backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 3 },
+  liveTagText: { color: '#fff', fontSize: 10, fontWeight: '700' },
+  liveScoreBadge: { position: 'absolute', left: 8, right: 8, bottom: 8, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6 },
+  liveScoreText: { color: '#fff', fontSize: 13, fontWeight: '800' },
+  livePhraseText: { color: '#9DB8F5', fontSize: 12, fontWeight: '700' },
+  chipsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  formationChip: { paddingHorizontal: 12, paddingVertical: 7, borderRadius: 999, backgroundColor: '#181F26', borderWidth: 1, borderColor: '#2A333B' },
+  formationChipOn: { backgroundColor: '#7FA5FF', borderColor: '#7FA5FF' },
+  formationChipText: { color: '#A2AFB9', fontSize: 12, fontWeight: '700' },
+  formationChipTextOn: { color: '#0E1317' },
+  formationStageWrap: { width: FORMATION_STAGE_WIDTH_PX, height: FORMATION_STAGE_HEIGHT_PX, maxWidth: '100%', alignSelf: 'center', borderRadius: 12, backgroundColor: '#12181D', borderWidth: 1, borderColor: '#2A333B', overflow: 'hidden' },
+  formationDancer: { position: 'absolute', width: 32, height: 32, borderRadius: 16, backgroundColor: '#7FA5FF', alignItems: 'center', justifyContent: 'center', userSelect: 'none', touchAction: 'none' },
+  formationDancerLabel: { color: '#0E1317', fontSize: 11, fontWeight: '800', userSelect: 'none' },
+  gridInputsRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
+  gridInput: { width: 52, backgroundColor: '#181F26', borderWidth: 1, borderColor: '#2A333B', borderRadius: 10, color: '#E8EDF2', textAlign: 'center', paddingVertical: 8 },
   headBtn: { marginTop: 12, alignSelf: 'flex-start', borderWidth: 1, borderColor: '#33456B', borderRadius: 9, paddingHorizontal: 12, paddingVertical: 7 },
   headBtnText: { color: '#7FA5FF', fontSize: 12, fontWeight: '800' },
   growHint: { color: '#4FC7A2', fontSize: 11.5, lineHeight: 17, marginTop: 7, fontWeight: '700' },
