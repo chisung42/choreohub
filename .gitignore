@@ -1,0 +1,55 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+/ios
+/android
+
+# 서버 로컬 상태 (팀원 병합 시 불필요/충돌 소지)
+mediapipe-service/.venv/
+mediapipe-service/__pycache__/
+mediapipe-service/uploads/
+mediapipe-service/choreohub.db
+mediapipe-service/choreohub.db-shm
+mediapipe-service/choreohub.db-wal
+
+# 세션 중 만든 편집 백업본
+.backup/
+
+# 로컬 환경 변수 (비밀은 없지만 관례상 제외, .env.example 참고)
+.env
