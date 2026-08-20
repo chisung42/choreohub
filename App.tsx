@@ -586,13 +586,19 @@ export default function App() {
   // 참고). 녹화된 클립은 기존 업로드·분석 파이프라인(uploadForAnalysis)에 그대로 태워
   // 서버가 다시 관절을 뽑게 한다 — 서버가 기록의 단일 진실 공급원이라는 원칙을 그대로 지킨다.
   type LiveStatus = 'idle' | 'requesting-camera' | 'loading-model' | 'ready' | 'running' | 'finishing' | 'done' | 'unsupported' | 'error';
+  type LiveMode = 'camera' | 'upload';
   const [liveStatus, setLiveStatus] = useState<LiveStatus>('idle');
+  const [liveMode, setLiveMode] = useState<LiveMode | null>(null);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [liveMirrored, setLiveMirrored] = useState(true);
   const [liveScore, setLiveScore] = useState(0);
   const [livePhrase, setLivePhrase] = useState('');
   const [liveProgress, setLiveProgress] = useState(0);
   const [liveJob, setLiveJob] = useState<JobProgress | null>(null);
+  // 업로드해서 분석하는 쪽은 실시간 점수가 없다 — 서버가 뽑은 관절을 이 작품의 기준
+  // 프레임과 DTW로 통째로 비교해(compareSequences, 버전 비교와 같은 계산) 한 번에 채점한다.
+  const [liveUploadResult, setLiveUploadResult] = useState<PoseCompareScore | null>(null);
+  const liveUploadGen = useRef(0);
   const camWrapRef = useRef<View>(null);
   const refWrapRef = useRef<View>(null);
   const camVideoElRef = useRef<HTMLVideoElement | null>(null);
@@ -622,6 +628,7 @@ export default function App() {
   const startLiveCamera = async () => {
     if (!selected) return;
     setLiveError(null);
+    setLiveMode('camera');
     setLiveStatus('requesting-camera');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
@@ -765,10 +772,61 @@ export default function App() {
 
   const stopLiveEarly = () => { refVideoElRef.current?.pause(); finishLiveSession(); };
 
+  // 웹캠이 없거나(카메라 못 켜는 환경) 이미 찍어 둔 영상으로 연습한 경우를 위한 두 번째
+  // 경로 — 라이브 점수 대신, 서버가 관절을 다 뽑은 뒤 이 작품의 기준 프레임과 한 번에
+  // DTW 로 비교한다("버전 비교"와 같은 계산, lib/poseCompare.ts). 저장되는 모양은 웹캠
+  // 경로와 똑같다(practice 엔드포인트는 영상이 어디서 왔는지 몰라도 된다).
+  const analyzeUploadedPractice = async (asset: MotionAsset) => {
+    if (!selected || !me) return;
+    const generation = ++liveUploadGen.current;
+    setLiveMode('upload'); setLiveError(null); setLiveUploadResult(null);
+    setLiveStatus('finishing'); setLiveJob(null);
+    try {
+      const motion = await new Promise<Record<string, any>>((resolve, reject) => {
+        uploadForAnalysis(asset,
+          job => { setLiveJob(job); if (job.stage === 'error') reject(new Error(job.error || '분석에 실패했어요.')); },
+          () => {},
+          result => resolve(result),
+          () => liveUploadGen.current === generation);
+      });
+      if (liveUploadGen.current !== generation) return;
+      if (!motion?.frames?.length) throw new Error('영상에서 사람의 동작을 인식하지 못했어요. 몸 전체가 잘 보이는 영상으로 다시 시도해 주세요.');
+      const headData = await api(`/v1/projects/${selected.id}/frames`);
+      const referenceFrames: MotionFrame[] = headData?.frames ?? [];
+      if (liveUploadGen.current !== generation) return;
+      if (!referenceFrames.length) throw new Error('이 작품엔 비교할 기준 포즈 데이터가 없어요.');
+      const result = compareSequences(motionFramesToPoseFrames(motion.frames), motionFramesToPoseFrames(referenceFrames));
+      if (liveUploadGen.current !== generation) return;
+      setLiveUploadResult(result);
+      await api(`/v1/projects/${selected.id}/practice`, { method: 'POST', body: {
+        user_id: me.user_id, reference_version_id: versions?.headId ?? null,
+        overall_score: Math.round(result.overallScore * 10) / 10, mirrored: result.mirrored, motion,
+      } });
+      if (liveUploadGen.current !== generation) return;
+      setLiveStatus('done');
+      notify('연습 기록을 저장했어요', `일치율 ${Math.round(result.overallScore)}% · 안무 자체는 바뀌지 않아요`, 'ok');
+    } catch (err: any) {
+      if (liveUploadGen.current !== generation) return;
+      setLiveStatus('error');
+      setLiveError(err?.message ?? '분석에 실패했어요.');
+    }
+  };
+
+  const pickPracticeVideo = async () => {
+    if (!selected) return;
+    const picked = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['videos'], allowsEditing: false });
+    if (picked.canceled) return;
+    const file = picked.assets[0];
+    await analyzeUploadedPractice({ uri: file.uri, fileName: file.fileName ?? `practice-${Date.now()}.mp4`,
+      mimeType: file.mimeType ?? 'video/mp4', duration: file.duration, source: 'library', webFile: file.file });
+  };
+
   const resetLive = () => {
     stopLiveCameraTracks();
+    liveUploadGen.current++;
     camVideoElRef.current = null; refVideoElRef.current = null;
-    setLiveStatus('idle'); setLiveError(null); setLiveScore(0); setLivePhrase(''); setLiveProgress(0); setLiveJob(null);
+    setLiveStatus('idle'); setLiveMode(null); setLiveError(null); setLiveScore(0); setLivePhrase('');
+    setLiveProgress(0); setLiveJob(null); setLiveUploadResult(null);
   };
 
   useEffect(() => {
@@ -1911,33 +1969,39 @@ export default function App() {
     </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
   };
   const Live = () => {
-    if (!isLiveSupported()) {
-      return <SafeAreaView style={s.safe}><Header title="실시간 연습" back={() => { resetLive(); go('version'); }}/><ScrollView contentContainerStyle={s.content}>
-        <View style={s.compareBaseCard}><Text style={s.meta}>이 기능은 웹 브라우저(Chrome/Edge)에서만 지원돼요. 앱에서는 아직 쓸 수 없어요.</Text></View>
-      </ScrollView><Bottom page="library" go={navTo} plus={()=>setModal(true)}/></SafeAreaView>;
-    }
+    // 실시간 웹캠 채점(driveFrameGrid/requestVideoFrameCallback)은 이 브라우저 API가 있는
+    // 곳에서만 된다. 영상 업로드 분석은 기존 업로드·비교 파이프라인만 쓰므로 어디서든 된다
+    // — 그래서 페이지 전체를 막지 않고, 카메라 버튼만 지원 여부에 따라 갈아 끼운다.
+    const cameraSupported = isLiveSupported();
     return <SafeAreaView style={s.safe}><Header title="실시간 연습" back={() => { resetLive(); go('version'); }}/><ScrollView contentContainerStyle={s.content}>
       <Text style={s.eyebrow}>LIVE PRACTICE</Text>
-      <Text style={s.title}>웹캠 보며 따라 추기</Text>
+      <Text style={s.title}>카메라 또는 영상으로{`\n`}따라 추기</Text>
 
-      <View style={s.liveVideoWrap}>
-        <View ref={refWrapRef} style={StyleSheet.absoluteFill}/>
-        <View style={s.liveTag}><Text style={s.liveTagText}>레퍼런스 · {selected?.name}</Text></View>
-      </View>
-      <View style={s.liveVideoWrap}>
-        <View ref={camWrapRef} style={StyleSheet.absoluteFill}/>
-        <View style={s.liveTag}><Text style={s.liveTagText}>내 웹캠</Text></View>
-        {liveStatus === 'running' ? <View style={s.liveScoreBadge}>
-          <Text style={s.liveScoreText}>{liveScore}%</Text>
-          {livePhrase ? <Text style={s.livePhraseText}>{livePhrase}</Text> : null}
-        </View> : null}
-      </View>
+      {liveMode !== 'upload' ? <>
+        <View style={s.liveVideoWrap}>
+          <View ref={refWrapRef} style={StyleSheet.absoluteFill}/>
+          <View style={s.liveTag}><Text style={s.liveTagText}>레퍼런스 · {selected?.name}</Text></View>
+        </View>
+        <View style={s.liveVideoWrap}>
+          <View ref={camWrapRef} style={StyleSheet.absoluteFill}/>
+          <View style={s.liveTag}><Text style={s.liveTagText}>내 웹캠</Text></View>
+          {liveStatus === 'running' ? <View style={s.liveScoreBadge}>
+            <Text style={s.liveScoreText}>{liveScore}%</Text>
+            {livePhrase ? <Text style={s.livePhraseText}>{livePhrase}</Text> : null}
+          </View> : null}
+        </View>
+      </> : null}
 
       {liveStatus === 'running' ? <View style={s.track}><View style={[s.fill, { width: `${liveProgress}%` }]}/></View> : null}
 
       {liveError ? <View style={s.compareBaseCard}><Text style={s.meta}>{liveError}</Text></View> : null}
 
-      {liveStatus === 'idle' ? <Pressable style={s.primary} onPress={startLiveCamera}><Text style={s.primaryText}>📷 카메라 켜기</Text></Pressable> : null}
+      {liveStatus === 'idle' ? <>
+        {cameraSupported
+          ? <Pressable style={s.primary} onPress={startLiveCamera}><Text style={s.primaryText}>📷 카메라 켜고 실시간으로 따라 추기</Text></Pressable>
+          : <View style={s.compareBaseCard}><Text style={s.meta}>실시간 웹캠 채점은 웹 브라우저(Chrome/Edge)에서만 지원돼요 — 영상을 올려서 분석하는 건 여기서도 쓸 수 있어요.</Text></View>}
+        <Pressable style={cameraSupported ? s.secondary : s.primary} onPress={pickPracticeVideo}><Text style={cameraSupported ? s.secondaryText : s.primaryText}>🎬 촬영된 영상 올려서 분석하기</Text></Pressable>
+      </> : null}
       {(liveStatus === 'requesting-camera' || liveStatus === 'loading-model') ? <Text style={s.meta}>{liveStatus === 'requesting-camera' ? '카메라 권한을 요청하는 중…' : '포즈 인식 모델을 불러오는 중…'}</Text> : null}
       {liveStatus === 'ready' ? <>
         <Pressable style={s.overlayRow} onPress={() => setLiveMirrored(v => !v)}>
@@ -1947,9 +2011,22 @@ export default function App() {
         <Pressable style={s.primary} onPress={startLiveSession}><Text style={s.primaryText}>▶ 시작 (영상이 재생돼요)</Text></Pressable>
       </> : null}
       {liveStatus === 'running' ? <Pressable style={[s.primary, s.primaryDisabled]} onPress={stopLiveEarly}><Text style={s.primaryText}>⏹ 종료하고 저장</Text></Pressable> : null}
-      {liveStatus === 'finishing' ? <Text style={s.meta}>{liveJob ? stageLabel(liveJob.stage, liveJob.done, liveJob.total) : '결과를 정리하는 중…'}</Text> : null}
+      {liveStatus === 'finishing' ? <Text style={s.meta}>{liveJob ? stageLabel(liveJob.stage, liveJob.done, liveJob.total) : (liveMode === 'upload' ? '기준 동작과 비교하는 중…' : '결과를 정리하는 중…')}</Text> : null}
       {liveStatus === 'done' ? <>
         <View style={s.compareBaseCard}><Text style={s.meta}>연습 기록으로 저장했어요 — 안무 자체는 그대로예요. 작업 기록(버전 목록)에는 나타나지 않아요.</Text></View>
+        {liveUploadResult ? <>
+          <View style={s.scoreCard}>
+            <Text style={s.scoreLabel}>일치율</Text>
+            <Text style={s.score}>{Math.round(liveUploadResult.overallScore)}<Text style={{ fontSize: 20 }}>%</Text></Text>
+            <View style={s.track}><View style={[s.fill, { width: `${liveUploadResult.overallScore}%` }]}/></View>
+            {liveUploadResult.mirrored ? <Text style={s.meta}>좌우가 반전된 영상으로 인식해 자동으로 뒤집어 비교했어요.</Text> : null}
+          </View>
+          <Text style={s.section}>가장 차이 나는 관절</Text>
+          {(liveUploadResult.segments[0]?.worstJoints ?? []).map(joint => <View key={joint.joint} style={s.overlayRow}>
+            <Text style={s.overlayLabel}>{joint.joint}</Text>
+            <Text style={s.compareJointDiff}>평균 {joint.avgDiffDeg}°</Text>
+          </View>)}
+        </> : null}
         <Pressable style={s.primary} onPress={() => { resetLive(); }}><Text style={s.primaryText}>다시 연습하기</Text></Pressable>
       </> : null}
       {liveStatus === 'error' ? <Pressable style={s.primary} onPress={() => { resetLive(); }}><Text style={s.primaryText}>처음부터 다시</Text></Pressable> : null}
@@ -2100,12 +2177,12 @@ export default function App() {
     const r = practiceRuns;
     return <SafeAreaView style={s.safe}><Header title="연습 기록" back={() => go('version')}/><ScrollView contentContainerStyle={s.content}>
       <Text style={s.eyebrow}>PRACTICE LOG</Text>
-      <Text style={s.title}>웹캠 연습{`\n`}기록을 모아봐요.</Text>
+      <Text style={s.title}>연습{`\n`}기록을 모아봐요.</Text>
       <Text style={s.countHint}>여기는 연습한 결과만 모아요 — 안무 자체를 바꾸는 수정 제안·버전과는 분리되어 있어서, 아무리 연습해도 작업 기록(버전)에는 나타나지 않아요.</Text>
 
       {r === 'loading' ? <Text style={s.meta}>불러오는 중…</Text> : null}
       {r === 'error' ? <Text style={s.meta}>연습 기록을 불러오지 못했어요.</Text> : null}
-      {r && r !== 'loading' && r !== 'error' && r.length === 0 ? <Text style={s.meta}>아직 연습 기록이 없어요. "실시간 연습"에서 웹캠으로 따라 추면 여기 쌓여요.</Text> : null}
+      {r && r !== 'loading' && r !== 'error' && r.length === 0 ? <Text style={s.meta}>아직 연습 기록이 없어요. "실시간 연습"에서 웹캠으로 따라 추거나 영상을 올려서 분석하면 여기 쌓여요.</Text> : null}
       {r && r !== 'loading' && r !== 'error' ? r.map(run => <View key={run.id} style={s.compareBaseCard}>
         <View style={s.overlayRow}>
           <Text style={s.compareBaseTitle}>일치율 {run.overallScore != null ? Math.round(run.overallScore) : '?'}%</Text>
