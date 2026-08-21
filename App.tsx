@@ -362,6 +362,11 @@ function MotionPlayer({ uri, frames = [], video, mode = 'overlay', positionRef, 
   const [stage, setStage] = useState({ width: 0, height: 0 });
   const [index, setIndex] = useState(frameRef?.current ?? 0);
   const indexRef = useRef(index);
+  // 오버레이/스켈레톤은 우리가 직접 그리는 SVG라, iOS 등의 네이티브 전체화면(별도
+  // 플레이어로 튀어나가는 것)으로 넘어가면 그 위에 그려둔 관절선이 통째로 안 보인다 —
+  // 그래서 그 모드에서는 네이티브 전체화면 버튼을 숨기고, 우리 화면 안에서 꽉 채우는
+  // 자체 "전체화면"을 대신 제공한다(오버레이가 그대로 유지된다).
+  const [immersive, setImmersive] = useState(false);
 
   // remount 되었거나 소스가 바뀌었으면 직전 재생 위치에서 이어 튼다.
   // 한 틱 미루는 이유: 업로드 직후 로컬 URI 가 서버 URI 로 교체되는데, 바로 play() 하면
@@ -403,10 +408,16 @@ function MotionPlayer({ uri, frames = [], video, mode = 'overlay', positionRef, 
     const { width, height } = event.nativeEvent.layout;
     setStage(current => current.width === width && current.height === height ? current : { width, height });
   };
+  // 세로로 찍은 연습 영상(9:16)이 대부분인데 상자 높이를 고정해 두면 좌우로 검은
+  // 여백이 크게 남는다 — 실제 영상의 가로세로 비율에 맞춰 상자 자체를 그 비율로 만든다.
+  const aspectRatio = video?.width && video?.height ? video.width / video.height : undefined;
+  const stageStyle = immersive
+    ? [s.videoStage, s.videoStageImmersive]
+    : [s.videoStage, aspectRatio ? { height: 'auto' as any, aspectRatio, maxHeight: 560 } : null];
 
   return (
-    <View style={s.videoStage} onLayout={onLayout}>
-      <VideoView style={s.video} player={player} nativeControls contentFit="contain" fullscreenOptions={{ enable: true }} />
+    <View style={stageStyle} onLayout={onLayout}>
+      <VideoView style={s.video} player={player} nativeControls contentFit="contain" fullscreenOptions={{ enable: mode === 'original' }} />
       {mode === 'skeleton' && <View pointerEvents="none" style={s.skeletonBackdrop} />}
       {mode !== 'original' && video ? <PoseOverlay landmarks={landmarks} stage={stage} video={video} /> : null}
       {mode !== 'original' && (
@@ -414,6 +425,9 @@ function MotionPlayer({ uri, frames = [], video, mode = 'overlay', positionRef, 
           <Text style={s.overlayCaptionText}>{frames.length ? `f${index} · ${landmarks?.length ?? 0} LANDMARKS` : '포즈 데이터 없음'}</Text>
         </View>
       )}
+      {mode !== 'original' ? <Pressable style={s.immersiveToggle} onPress={() => setImmersive(v => !v)}>
+        <Text style={s.immersiveToggleText}>{immersive ? '✕ 닫기' : '⤢ 전체화면'}</Text>
+      </Pressable> : null}
     </View>
   );
 }
@@ -2668,6 +2682,9 @@ Object.assign(s, {
   uploadedCard: { minHeight: 86, backgroundColor: '#181F26', borderWidth: 1, borderColor: '#2A333B', borderRadius: 18, padding: 14, marginBottom: 10, flexDirection: 'row', alignItems: 'center', gap: 12 },
   uploadedMeta: { fontSize: 11, color: '#4FC7A2', marginTop: 7, fontWeight: '700' },
   videoStage: { height: 310, backgroundColor: '#0A0F14', borderRadius: 22, overflow: 'hidden' },
+  videoStageImmersive: { position: 'fixed' as any, top: 0, left: 0, right: 0, bottom: 0, zIndex: 999, borderRadius: 0, height: '100%' as any },
+  immersiveToggle: { position: 'absolute', top: 10, right: 10, backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6 },
+  immersiveToggleText: { color: '#fff', fontSize: 12, fontWeight: '700' },
   video: { width: '100%', height: '100%' },
   videoPlaceholder: { height: 310, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: '#0A0F14', padding: 26 },
   videoPlaceholderIcon: { color: '#E0AE3C', fontSize: 42 },
