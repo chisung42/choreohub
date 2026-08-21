@@ -417,7 +417,10 @@ function MotionPlayer({ uri, frames = [], video, mode = 'overlay', positionRef, 
 
   return (
     <View style={stageStyle} onLayout={onLayout}>
-      <VideoView style={s.video} player={player} nativeControls contentFit="contain" fullscreenOptions={{ enable: mode === 'original' }} />
+      {/* playsInline 이 없으면 iOS Safari는 재생 버튼만 눌러도 무조건 네이티브 전체화면으로
+          튀어나간다 — 버튼을 숨겨도 소용없었던 진짜 원인이 이거였다. inline 재생을 강제해야
+          우리 화면 안에(오버레이와 함께) 머문다. */}
+      <VideoView style={s.video} player={player} nativeControls contentFit="contain" playsInline fullscreenOptions={{ enable: mode === 'original' }} />
       {mode === 'skeleton' && <View pointerEvents="none" style={s.skeletonBackdrop} />}
       {mode !== 'original' && video ? <PoseOverlay landmarks={landmarks} stage={stage} video={video} /> : null}
       {mode !== 'original' && (
